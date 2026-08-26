@@ -1,0 +1,12 @@
+# Step 1 (GPU / sm_120): install PyTorch from the cu128 index
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#
+# Step 2: install server deps
+#   pip install -r requirements.txt
+#
+# Tested stack (local WSL2, Aug 2026): torch==2.13.0, vllm==0.27.1
+
+vllm>=0.18.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+huggingface_hub[cli]>=0.26.0
