@@ -87,27 +87,35 @@ Optional login for gated models: `hf auth login`
 
 ## Step 6 — Launch server
 
-From WSL2, project root:
+From WSL2 (recommended — use `scripts/serve.sh`):
 
 ```bash
 cd /mnt/c/dev/turboquant-llm
-source .venv/bin/activate
-uvicorn app.server:app --host 0.0.0.0 --port 8000
+bash scripts/serve.sh --context 32768
 ```
 
-Engine args (set in `app/server.py`):
+Other context lengths:
+
+```bash
+bash scripts/serve.sh 16384          # positional
+bash scripts/serve.sh --context 8192
+MAX_MODEL_LEN=32768 bash scripts/serve.sh
+bash scripts/serve.sh --help
+```
+
+Engine args (via `serve.sh` env / flags):
 
 - `model=Qwen/Qwen3-14B-AWQ`
 - `quantization=awq`
 - `kv_cache_dtype=turboquant_k8v4`
-- `gpu_memory_utilization=0.85`
-- `max_model_len=8192`
-- `kv_offloading_size=8.0` (GiB of CPU RAM for overflow KV blocks)
+- `gpu_memory_utilization=0.88` (`--gpu-mem`)
+- `max_model_len=16384` (`--context` / `MAX_MODEL_LEN`)
+- `kv_offloading_size=8.0` (`--kv-offload`)
 - `max_num_seqs=2`
 
-Override via env: `MODEL_ID`, `GPU_MEMORY_UTILIZATION`, `MAX_MODEL_LEN`, `KV_OFFLOADING_SIZE`, `KV_OFFLOADING_BACKEND`, `MAX_NUM_SEQS`.
+`/v1/models` reports `max_model_len` and `context_length` for clients (e.g. Cursor).
 
-First startup loads weights (~1–3 min).
+First startup loads weights (~1–3 min). **Restart required** after changing context length.
 
 ## Step 7 — Verification
 
@@ -162,6 +170,14 @@ wsl -d Ubuntu bash -c "export ENABLE_OLLAMA_API=false OPENAI_API_BASE_URL=http:/
 ## Browser automation (Comet-like)
 
 Uses [browser-use](https://github.com/browser-use/browser-use) (Playwright + your local LLM at `:8000`) to complete natural-language web tasks.
+
+## start tunnel to use model from cursur
+wsl -d Ubuntu bash -lc "sed -i 's/\r$//' /mnt/c/dev/turboquant-llm/scripts/tunnel.sh && cd /mnt/c/dev/turboquant-llm && bash scripts/tunnel.sh"
+### once tunnel started then set the base url in cursur of openai as
+
+<tunnel base url>/v1
+api key - local
+model name - exact that yopiu have
 
 **Install once (WSL):**
 

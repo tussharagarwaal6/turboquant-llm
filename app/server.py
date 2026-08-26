@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import re
 import sys
@@ -71,6 +72,98 @@ def _env_bool(key: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().strip("\r").lower() in {"1", "true", "yes", "on"}
+
+
+logger = logging.getLogger("turboquant.server")
+
+REQUESTED_MAX_MODEL_LEN = _env_int("MAX_MODEL_LEN", "16384")
+# Set after engine init; may be lower than requested when VRAM is tight.
+effective_max_model_len = REQUESTED_MAX_MODEL_LEN
+
+
+def _env_explicit(key: str) -> bool:
+    return os.environ.get(key) is not None
+
+
+def _auto_gpu_memory_utilization(requested_max_len: int) -> float:
+    if _env_explicit("GPU_MEMORY_UTILIZATION"):
+        return _env_float("GPU_MEMORY_UTILIZATION", "0.88")
+    if requested_max_len <= 16384:
+        return 0.88
+    if requested_max_len <= 32768:
+        return 0.92
+    return 0.95
+
+
+def _auto_kv_offloading_size(requested_max_len: int) -> float:
+    """Scale CPU/system-RAM KV spillover with requested context length."""
+    if _env_explicit("KV_OFFLOADING_SIZE"):
+        return _env_float("KV_OFFLOADING_SIZE", "8.0")
+    # ~8 GiB base plus ~1 GiB per 4k tokens above 8k (32768 -> 16 GiB).
+    return max(8.0, requested_max_len / 2048.0)
+
+
+def _build_engine_args(
+    *,
+    max_model_len: int,
+    gpu_memory_utilization: float,
+    kv_offloading_size: float,
+) -> AsyncEngineArgs:
+    return AsyncEngineArgs(
+        model=MODEL_ID,
+        quantization="awq",
+        kv_cache_dtype="turboquant_k8v4",
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        kv_offloading_size=kv_offloading_size,
+        kv_offloading_backend=os.environ.get("KV_OFFLOADING_BACKEND", "native"),
+        max_num_seqs=_env_int("MAX_NUM_SEQS", "2"),
+        trust_remote_code=True,
+    )
+
+
+def _create_engine() -> AsyncLLMEngine:
+    requested = REQUESTED_MAX_MODEL_LEN
+    gpu_mem = _auto_gpu_memory_utilization(requested)
+    kv_offload = _auto_kv_offloading_size(requested)
+    auto_fit = _env_bool("AUTO_FIT_MAX_MODEL_LEN", True)
+
+    attempts: list[tuple[str, int, float]] = [
+        ("requested", requested, gpu_mem),
+    ]
+    if auto_fit and requested != -1:
+        attempts.append(("auto-fit", -1, gpu_mem))
+        if not _env_explicit("GPU_MEMORY_UTILIZATION") and gpu_mem < 0.95:
+            attempts.append(("auto-fit", -1, 0.95))
+
+    last_error: Exception | None = None
+    for label, max_len, mem_frac in attempts:
+        logger.info(
+            "Starting engine (%s): max_model_len=%s gpu_memory_utilization=%.2f "
+            "kv_offloading_size=%.1f GiB",
+            label,
+            "auto" if max_len == -1 else max_len,
+            mem_frac,
+            kv_offload,
+        )
+        try:
+            return AsyncLLMEngine.from_engine_args(
+                _build_engine_args(
+                    max_model_len=max_len,
+                    gpu_memory_utilization=mem_frac,
+                    kv_offloading_size=kv_offload,
+                )
+            )
+        except RuntimeError as exc:
+            last_error = exc
+            logger.warning(
+                "Engine startup failed (%s): %s",
+                label,
+                exc,
+            )
+
+    assert last_error is not None
+    raise last_error
 
 
 _THINKING_BLOCK = re.compile(
@@ -252,20 +345,18 @@ def _stream_chunk(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global engine, tokenizer
+    global engine, tokenizer, effective_max_model_len
 
-    engine_args = AsyncEngineArgs(
-        model=MODEL_ID,
-        quantization="awq",
-        kv_cache_dtype="turboquant_k8v4",
-        gpu_memory_utilization=_env_float("GPU_MEMORY_UTILIZATION", "0.88"),
-        max_model_len=_env_int("MAX_MODEL_LEN", "16384"),
-        kv_offloading_size=_env_float("KV_OFFLOADING_SIZE", "8.0"),
-        kv_offloading_backend=os.environ.get("KV_OFFLOADING_BACKEND", "native"),
-        max_num_seqs=_env_int("MAX_NUM_SEQS", "2"),
-        trust_remote_code=True,
-    )
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    engine = _create_engine()
+    effective_max_model_len = engine.model_config.max_model_len
+    if effective_max_model_len < REQUESTED_MAX_MODEL_LEN:
+        logger.warning(
+            "Requested max context %d tokens exceeds GPU KV capacity; serving "
+            "%d tokens with %.1f GiB CPU KV offload for spillover.",
+            REQUESTED_MAX_MODEL_LEN,
+            effective_max_model_len,
+            _auto_kv_offloading_size(REQUESTED_MAX_MODEL_LEN),
+        )
 
     maybe_tokenizer = engine.get_tokenizer()
     tokenizer = (
@@ -289,6 +380,9 @@ async def list_models() -> dict[str, Any]:
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "local",
+                "max_model_len": effective_max_model_len,
+                "context_length": effective_max_model_len,
+                "requested_context_length": REQUESTED_MAX_MODEL_LEN,
             }
         ],
     }
