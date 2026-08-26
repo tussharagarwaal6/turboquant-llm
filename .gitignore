@@ -27,6 +27,7 @@ wheels/
 .env
 .env.*
 !.env.example
+browser/.env
 
 # Local artifacts
 *.zip

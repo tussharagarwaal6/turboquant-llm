@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -14,7 +15,7 @@ from typing import Any, AsyncGenerator, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # WSL2 GPU passthrough does not expose UVA, which the V2 model runner requires.
 os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -65,6 +66,84 @@ def _env_int(key: str, default: str) -> int:
     return int(os.environ.get(key, default))
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().strip("\r").lower() in {"1", "true", "yes", "on"}
+
+
+_THINKING_BLOCK = re.compile(
+    r"<\s*(?:think|redacted_thinking)\s*>[\s\S]*?<\s*/\s*(?:think|redacted_thinking)\s*>",
+    re.IGNORECASE,
+)
+_UNCLOSED_THINKING = re.compile(
+    r"^[\s\S]*?<\s*(?:think|redacted_thinking)\s*>",
+    re.IGNORECASE,
+)
+
+
+def _strip_thinking(text: str) -> str:
+    cleaned = _THINKING_BLOCK.sub("", text).lstrip()
+    return _UNCLOSED_THINKING.sub("", cleaned).lstrip()
+
+
+def _normalize_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                if part.get("type") == "text" and "text" in part:
+                    parts.append(str(part["text"]))
+                elif part.get("type") == "image_url":
+                    parts.append("[image]")
+                else:
+                    parts.append(json.dumps(part, ensure_ascii=False))
+            else:
+                parts.append(str(part))
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _extract_json_text(text: str) -> str:
+    stripped = text.strip()
+    fenced = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", stripped, re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip()
+    return stripped
+
+
+def _rename_element_index(value: Any) -> Any:
+    if isinstance(value, dict):
+        normalized = {key: _rename_element_index(item) for key, item in value.items()}
+        if "element_index" in normalized and "index" not in normalized:
+            normalized["index"] = normalized.pop("element_index")
+        else:
+            normalized.pop("element_index", None)
+        return normalized
+    if isinstance(value, list):
+        return [_rename_element_index(item) for item in value]
+    return value
+
+
+def _normalize_completion(text: str) -> str:
+    cleaned = _strip_thinking(text)
+    candidate = _extract_json_text(cleaned)
+    if not candidate.startswith(("{", "[")):
+        return cleaned
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return cleaned
+    return json.dumps(_rename_element_index(parsed), ensure_ascii=False)
+
+
 engine: AsyncLLMEngine | None = None
 tokenizer = None
 
@@ -72,6 +151,11 @@ tokenizer = None
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _coerce_content(cls, value: Any) -> str:
+        return _normalize_message_content(value)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -97,11 +181,17 @@ def _build_sampling_params(body: ChatCompletionRequest) -> SamplingParams:
 
 def _messages_to_prompt(messages: list[ChatMessage]) -> str:
     payload = [{"role": m.role, "content": m.content} for m in messages]
-    return tokenizer.apply_chat_template(
-        payload,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    base = {"tokenize": False, "add_generation_prompt": True}
+    if not _env_bool("ENABLE_THINKING", False):
+        try:
+            return tokenizer.apply_chat_template(
+                payload,
+                **base,
+                enable_thinking=False,
+            )
+        except TypeError:
+            pass
+    return tokenizer.apply_chat_template(payload, **base)
 
 
 def _estimate_prompt_tokens(prompt: str) -> int:
@@ -168,8 +258,8 @@ async def lifespan(_: FastAPI):
         model=MODEL_ID,
         quantization="awq",
         kv_cache_dtype="turboquant_k8v4",
-        gpu_memory_utilization=_env_float("GPU_MEMORY_UTILIZATION", "0.85"),
-        max_model_len=_env_int("MAX_MODEL_LEN", "8192"),
+        gpu_memory_utilization=_env_float("GPU_MEMORY_UTILIZATION", "0.88"),
+        max_model_len=_env_int("MAX_MODEL_LEN", "16384"),
         kv_offloading_size=_env_float("KV_OFFLOADING_SIZE", "8.0"),
         kv_offloading_backend=os.environ.get("KV_OFFLOADING_BACKEND", "native"),
         max_num_seqs=_env_int("MAX_NUM_SEQS", "2"),
@@ -235,7 +325,7 @@ async def chat_completions(body: ChatCompletionRequest):
     final_text = ""
     completion_tokens = 0
     async for output in engine.generate(prompt, sampling_params, request_id):
-        final_text = output.outputs[0].text
+        final_text = _normalize_completion(output.outputs[0].text)
         completion_tokens = len(output.outputs[0].token_ids)
 
     return JSONResponse(
@@ -261,7 +351,7 @@ async def _stream_chat_completion(
 
     previous_text = ""
     async for output in engine.generate(prompt, sampling_params, request_id):
-        current_text = output.outputs[0].text
+        current_text = _normalize_completion(output.outputs[0].text)
         delta = current_text[len(previous_text) :]
         previous_text = current_text
         if delta:

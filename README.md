@@ -158,3 +158,33 @@ wsl -d Ubuntu bash -c "cd /mnt/c/dev/turboquant-llm && ~/turboquant-llm/.venv/bi
 
 ## for openweb ui to access llm
 wsl -d Ubuntu bash -c "export ENABLE_OLLAMA_API=false OPENAI_API_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=local && ~/open-webui/.venv/bin/open-webui serve --host 0.0.0.0 --port 3000"
+
+## Browser automation (Comet-like)
+
+Uses [browser-use](https://github.com/browser-use/browser-use) (Playwright + your local LLM at `:8000`) to complete natural-language web tasks.
+
+**Install once (WSL):**
+
+```bash
+source /mnt/c/dev/turboquant-llm/.venv/bin/activate
+pip install -r browser/requirements-browser.txt
+playwright install chromium
+cp browser/.env.example browser/.env   # optional overrides
+```
+
+**Run a task:**
+
+```bash
+# Inline task
+bash scripts/run_browser_agent.sh "Open https://example.com and return the H1 text"
+
+# From a task file
+bash scripts/run_browser_agent.sh --task-file browser/tasks/smoke_example.md
+bash scripts/run_browser_agent.sh --task-file browser/tasks/api_docs_smoke.md
+```
+
+**Cursor-only (no install):** paste tasks from [`browser/cursor-tasks/`](browser/cursor-tasks/) into Agent mode — uses the built-in browser MCP.
+
+**Env vars** (`browser/.env`): `OPENAI_API_BASE`, `BROWSER_LLM_MODEL`, `BROWSER_HEADLESS`, `BROWSER_USE_VISION`, `BROWSER_MAX_STEPS`.
+
+**Note:** Qwen3-14B-AWQ works for simple smoke tasks; complex multi-site flows may need a stronger model or cloud API via the same env vars.
