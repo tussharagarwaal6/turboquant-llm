@@ -19,6 +19,10 @@ from pydantic import BaseModel, Field
 # WSL2 GPU passthrough does not expose UVA, which the V2 model runner requires.
 os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
+# Native KV offload uses /dev/shm mmap + madvise, which fails on WSL2 (errno 14).
+# SimpleCPUOffloadConnector uses pinned host RAM instead.
+os.environ.setdefault("VLLM_USE_SIMPLE_KV_OFFLOAD", "1")
+
 # The pip CUDA toolkit ships nvcc 13.3 against 13.0 headers, which CCCL rejects, so
 # FlashInfer's JIT sampler cannot build. TurboQuant itself only needs Triton.
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
@@ -51,6 +55,15 @@ from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams  # noqa: E402
 
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3-14B-AWQ")
 SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL_ID)
+
+
+def _env_float(key: str, default: str) -> float:
+    return float(os.environ.get(key, default))
+
+
+def _env_int(key: str, default: str) -> int:
+    return int(os.environ.get(key, default))
+
 
 engine: AsyncLLMEngine | None = None
 tokenizer = None
@@ -155,8 +168,11 @@ async def lifespan(_: FastAPI):
         model=MODEL_ID,
         quantization="awq",
         kv_cache_dtype="turboquant_k8v4",
-        gpu_memory_utilization=float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90")),
-        max_model_len=int(os.environ.get("MAX_MODEL_LEN", "16384")),
+        gpu_memory_utilization=_env_float("GPU_MEMORY_UTILIZATION", "0.85"),
+        max_model_len=_env_int("MAX_MODEL_LEN", "8192"),
+        kv_offloading_size=_env_float("KV_OFFLOADING_SIZE", "8.0"),
+        kv_offloading_backend=os.environ.get("KV_OFFLOADING_BACKEND", "native"),
+        max_num_seqs=_env_int("MAX_NUM_SEQS", "2"),
         trust_remote_code=True,
     )
     engine = AsyncLLMEngine.from_engine_args(engine_args)

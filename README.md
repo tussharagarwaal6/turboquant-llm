@@ -100,10 +100,12 @@ Engine args (set in `app/server.py`):
 - `model=Qwen/Qwen3-14B-AWQ`
 - `quantization=awq`
 - `kv_cache_dtype=turboquant_k8v4`
-- `gpu_memory_utilization=0.90`
-- `max_model_len=16384`
+- `gpu_memory_utilization=0.85`
+- `max_model_len=8192`
+- `kv_offloading_size=8.0` (GiB of CPU RAM for overflow KV blocks)
+- `max_num_seqs=2`
 
-Override via env: `MODEL_ID`, `GPU_MEMORY_UTILIZATION`, `MAX_MODEL_LEN`.
+Override via env: `MODEL_ID`, `GPU_MEMORY_UTILIZATION`, `MAX_MODEL_LEN`, `KV_OFFLOADING_SIZE`, `KV_OFFLOADING_BACKEND`, `MAX_NUM_SEQS`.
 
 First startup loads weights (~1–3 min).
 
@@ -146,10 +148,13 @@ Works with Open WebUI, Chatbox, Jan, Continue, etc.
 | `sm_120` not in `torch.cuda.get_arch_list()` | Reinstall torch from cu128 index only; confirm driver >= 570 |
 | `nvidia-smi` fails inside WSL2 | Update Windows NVIDIA driver; run `wsl --update`; reboot |
 | CUDA OOM at engine start | Lower `MAX_MODEL_LEN=8192` or `GPU_MEMORY_UTILIZATION=0.85`; close other GPU apps (e.g. LM Studio) |
+| Generation stops mid-stream | KV cache full on GPU; defaults enable CPU offload (`KV_OFFLOADING_SIZE=8`). Try `MAX_NUM_SEQS=1` or raise `KV_OFFLOADING_SIZE=12` |
+| `No space left on device` / `/dev/shm` full on WSL2 | Stale offload mmap from crashed runs: `rm -f /dev/shm/vllm_offload_*.mmap` after stopping server. Code uses `VLLM_USE_SIMPLE_KV_OFFLOAD=1` to avoid new mmap files |
+| Startup fails with `madvise` / `Bad address` on WSL2 | Fixed in code via `VLLM_USE_SIMPLE_KV_OFFLOAD=1` (pinned RAM path, not `/dev/shm` mmap) |
 
 
-## One liner to staret the application
-wsl -d Ubuntu bash -c "cd /mnt/c/dev/turboquant-llm && GPU_MEMORY_UTILIZATION=0.92 MAX_MODEL_LEN=8192 ~/turboquant-llm/.venv/bin/python -m uvicorn app.server:app --host 0.0.0.0 --port 8000"
+## One liner to start the application
+wsl -d Ubuntu bash -c "cd /mnt/c/dev/turboquant-llm && ~/turboquant-llm/.venv/bin/python -m uvicorn app.server:app --host 0.0.0.0 --port 8000"
 
 ## for openweb ui to access llm
 wsl -d Ubuntu bash -c "export ENABLE_OLLAMA_API=false OPENAI_API_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=local && ~/open-webui/.venv/bin/open-webui serve --host 0.0.0.0 --port 3000"
