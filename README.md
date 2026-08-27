@@ -2,7 +2,57 @@
 
 OpenAI-compatible local LLM server: **Qwen3-14B-AWQ** on vLLM with **TurboQuant** KV-cache compression (`turboquant_k8v4`), running in WSL2 Ubuntu with RTX 5080 GPU passthrough.
 
-## Prerequisites (Windows)
+**Agent UI:** pair with [open-webui](https://github.com/tussharagarwaal6/openwebui) for web search, RAG, and code tools.
+
+---
+
+## Quick start (daily use)
+
+After [one-time setup](#step-1--wsl2--gpu-verification) below, run the stack like this:
+
+### 1. Start the LLM (this repo)
+
+**WSL Ubuntu** — leave this terminal open:
+
+```bash
+cd /mnt/c/dev/turboquant-llm
+bash scripts/serve.sh
+```
+
+Wait for `Application startup complete` (~1–3 min).
+
+Verify:
+
+```bash
+curl http://localhost:8000/v1/models
+bash scripts/test_tool_call.sh   # should print PASS
+```
+
+### 2. Start Open WebUI (Windows)
+
+**PowerShell** (Docker Desktop running):
+
+```powershell
+cd c:\dev\open-webui
+.\start.ps1
+```
+
+Open **http://localhost:3000** → enable **Web Search** and **Code Interpreter** in the chat Integrations (+) menu.
+
+Full UI instructions: [open-webui README](https://github.com/tussharagarwaal6/openwebui#step-by-step-run-llm--open-webui).
+
+### 3. Stop when done
+
+| Component | Command |
+|---|---|
+| Open WebUI | `cd c:\dev\open-webui; .\stop.ps1` |
+| TurboQuant | `Ctrl+C` in the WSL terminal, or `bash scripts/kill_gpu.sh` |
+
+---
+
+## One-time setup
+
+### Prerequisites
 
 - Windows 11, NVIDIA driver **>= 570** (verify: `nvidia-smi` on Windows)
 - WSL2 with Ubuntu (verify: `wsl -l -v`)
@@ -138,6 +188,18 @@ curl -N -X POST http://localhost:8000/v1/chat/completions `
   -H "Content-Type: application/json" `
   -d '{"model":"Qwen/Qwen3-14B-AWQ","messages":[{"role":"user","content":"Count to 3."}],"max_tokens":32,"stream":true}'
 ```
+
+**Tool calling test (required for Open WebUI agent tools):**
+
+Must be **POST**, not GET. From WSL:
+
+```bash
+bash scripts/test_tool_call.sh
+```
+
+Expect `finish_reason: "tool_calls"` and `search_web` in the response. Parser defaults to Hermes (`TOOL_CALL_PARSER=hermes`).
+
+If you see `{"detail":"Method Not Allowed"}`, you hit the endpoint without `-X POST` (e.g. browser address bar).
 
 ### Connect any OpenAI-compatible chat client (Windows)
 

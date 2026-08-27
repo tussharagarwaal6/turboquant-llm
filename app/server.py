@@ -16,7 +16,7 @@ from typing import Any, AsyncGenerator, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # WSL2 GPU passthrough does not expose UVA, which the V2 model runner requires.
 os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -54,9 +54,14 @@ if "CUDA_HOME" in os.environ:
 os.environ["PATH"] = os.pathsep.join([*_bin_dirs, os.environ.get("PATH", "")])
 
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams  # noqa: E402
+from vllm.entrypoints.openai.chat_completion.protocol import (  # noqa: E402
+    ChatCompletionRequest as VllmChatCompletionRequest,
+)
+from vllm.tool_parsers import ToolParserManager  # noqa: E402
 
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3-14B-AWQ")
 SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL_ID)
+TOOL_CALL_PARSER = os.environ.get("TOOL_CALL_PARSER", "hermes")
 
 
 def _env_float(key: str, default: str) -> float:
@@ -247,15 +252,43 @@ def _normalize_completion(text: str) -> str:
 
 engine: AsyncLLMEngine | None = None
 tokenizer = None
+tool_parser_cls: type | None = None
+
+
+class FunctionCallSpec(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCallSpec(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: FunctionCallSpec
+
+
+class FunctionDefinition(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+
+
+class ToolDefinition(BaseModel):
+    type: Literal["function"] = "function"
+    function: FunctionDefinition
 
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str
+    content: str | None = None
+    tool_calls: list[ToolCallSpec] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
     @field_validator("content", mode="before")
     @classmethod
-    def _coerce_content(cls, value: Any) -> str:
+    def _coerce_content(cls, value: Any) -> str | None:
+        if value is None:
+            return None
         return _normalize_message_content(value)
 
 
@@ -267,8 +300,10 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = Field(default=512, alias="max_tokens")
     stream: bool = False
     stop: str | list[str] | None = None
+    tools: list[ToolDefinition] | None = None
+    tool_choice: str | dict[str, Any] | None = None
 
-    model_config = {"populate_by_name": True}
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
 
 def _build_sampling_params(body: ChatCompletionRequest) -> SamplingParams:
@@ -280,19 +315,131 @@ def _build_sampling_params(body: ChatCompletionRequest) -> SamplingParams:
     )
 
 
-def _messages_to_prompt(messages: list[ChatMessage]) -> str:
-    payload = [{"role": m.role, "content": m.content} for m in messages]
-    base = {"tokenize": False, "add_generation_prompt": True}
+def _message_to_dict(message: ChatMessage) -> dict[str, Any]:
+    payload: dict[str, Any] = {"role": message.role}
+    if message.content is not None:
+        payload["content"] = message.content
+    elif message.role == "assistant":
+        payload["content"] = None
+    if message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "id": tool_call.id,
+                "type": tool_call.type,
+                "function": {
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                },
+            }
+            for tool_call in message.tool_calls
+        ]
+    if message.tool_call_id:
+        payload["tool_call_id"] = message.tool_call_id
+    if message.name:
+        payload["name"] = message.name
+    return payload
+
+
+def _tools_enabled(body: ChatCompletionRequest) -> bool:
+    return bool(body.tools) and body.tool_choice != "none"
+
+
+def _messages_to_prompt(body: ChatCompletionRequest) -> str:
+    payload = [_message_to_dict(message) for message in body.messages]
+    template_kwargs: dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    if _tools_enabled(body):
+        template_kwargs["tools"] = [
+            {
+                "type": tool.type,
+                "function": tool.function.model_dump(exclude_none=True),
+            }
+            for tool in body.tools or []
+        ]
+        template_kwargs["tool_choice"] = body.tool_choice or "auto"
     if not _env_bool("ENABLE_THINKING", False):
         try:
             return tokenizer.apply_chat_template(
                 payload,
-                **base,
+                **template_kwargs,
                 enable_thinking=False,
             )
         except TypeError:
             pass
-    return tokenizer.apply_chat_template(payload, **base)
+    return tokenizer.apply_chat_template(payload, **template_kwargs)
+
+
+def _build_vllm_chat_request(body: ChatCompletionRequest) -> VllmChatCompletionRequest:
+    data: dict[str, Any] = {
+        "model": body.model,
+        "messages": [_message_to_dict(message) for message in body.messages],
+        "stream": body.stream,
+    }
+    if body.tools:
+        data["tools"] = [
+            {
+                "type": tool.type,
+                "function": tool.function.model_dump(exclude_none=True),
+            }
+            for tool in body.tools
+        ]
+    if body.tool_choice is not None:
+        data["tool_choice"] = body.tool_choice
+    elif body.tools:
+        data["tool_choice"] = "auto"
+    return VllmChatCompletionRequest.model_validate(data)
+
+
+def _create_tool_parser():
+    if tokenizer is None or tool_parser_cls is None:
+        raise HTTPException(status_code=503, detail="Tool parser not initialized")
+    return tool_parser_cls(tokenizer)
+
+
+def _prepare_model_output(text: str, *, tools_active: bool) -> str:
+    cleaned = _strip_thinking(text) if not _env_bool("ENABLE_THINKING", False) else text
+    if tools_active:
+        return cleaned
+    return _normalize_completion(text)
+
+
+def _tool_calls_to_openai(tool_calls: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": tool_call.id,
+            "type": tool_call.type,
+            "function": {
+                "name": tool_call.function.name,
+                "arguments": tool_call.function.arguments,
+            },
+        }
+        for tool_call in tool_calls
+    ]
+
+
+def _delta_message_to_openai(delta: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if delta.role is not None:
+        payload["role"] = delta.role
+    if delta.content is not None:
+        payload["content"] = delta.content
+    if delta.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "index": tool_call.index,
+                **({"id": tool_call.id} if tool_call.id is not None else {}),
+                **({"type": tool_call.type} if tool_call.type is not None else {}),
+                **(
+                    {"function": tool_call.function.model_dump(exclude_none=True)}
+                    if tool_call.function is not None
+                    else {}
+                ),
+            }
+            for tool_call in delta.tool_calls
+        ]
+    return payload
 
 
 def _estimate_prompt_tokens(prompt: str) -> int:
@@ -303,11 +450,22 @@ def _chat_completion_object(
     *,
     request_id: str,
     model: str,
-    content: str,
+    content: str | None,
     prompt_tokens: int,
     completion_tokens: int,
+    tool_calls: list[Any] | None = None,
+    finish_reason: str = "stop",
 ) -> dict[str, Any]:
     created = int(time.time())
+    message: dict[str, Any] = {"role": "assistant"}
+    if content is not None:
+        message["content"] = content
+    elif tool_calls:
+        message["content"] = None
+    else:
+        message["content"] = ""
+    if tool_calls:
+        message["tool_calls"] = _tool_calls_to_openai(tool_calls)
     return {
         "id": f"chatcmpl-{request_id}",
         "object": "chat.completion",
@@ -316,8 +474,8 @@ def _chat_completion_object(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -332,9 +490,12 @@ def _stream_chunk(
     *,
     request_id: str,
     model: str,
-    delta_content: str | None,
+    delta: dict[str, Any] | None = None,
+    delta_content: str | None = None,
     finish_reason: str | None = None,
 ) -> str:
+    if delta is None:
+        delta = {"content": delta_content} if delta_content is not None else {}
     payload = {
         "id": f"chatcmpl-{request_id}",
         "object": "chat.completion.chunk",
@@ -343,7 +504,7 @@ def _stream_chunk(
         "choices": [
             {
                 "index": 0,
-                "delta": {"content": delta_content} if delta_content is not None else {},
+                "delta": delta,
                 "finish_reason": finish_reason,
             }
         ],
@@ -353,7 +514,7 @@ def _stream_chunk(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global engine, tokenizer, effective_max_model_len
+    global engine, tokenizer, effective_max_model_len, tool_parser_cls
 
     engine = _create_engine()
     effective_max_model_len = engine.model_config.max_model_len
@@ -370,9 +531,12 @@ async def lifespan(_: FastAPI):
     tokenizer = (
         await maybe_tokenizer if inspect.isawaitable(maybe_tokenizer) else maybe_tokenizer
     )
+    tool_parser_cls = ToolParserManager.get_tool_parser(TOOL_CALL_PARSER)
+    logger.info("Tool calling enabled with parser '%s'", TOOL_CALL_PARSER)
     yield
     engine = None
     tokenizer = None
+    tool_parser_cls = None
 
 
 app = FastAPI(title="TurboQuant vLLM OpenAI API", lifespan=lifespan)
@@ -407,10 +571,13 @@ async def chat_completions(body: ChatCompletionRequest):
             detail=f"Model '{body.model}' not found. Use '{SERVED_MODEL_NAME}'.",
         )
 
-    prompt = _messages_to_prompt(body.messages)
+    tools_active = _tools_enabled(body)
+    prompt = _messages_to_prompt(body)
     sampling_params = _build_sampling_params(body)
     request_id = uuid.uuid4().hex
     prompt_tokens = _estimate_prompt_tokens(prompt)
+    vllm_request = _build_vllm_chat_request(body) if tools_active else None
+    parser = _create_tool_parser() if tools_active else None
 
     if body.stream:
         return StreamingResponse(
@@ -420,6 +587,9 @@ async def chat_completions(body: ChatCompletionRequest):
                 request_id=request_id,
                 model=body.model,
                 prompt_tokens=prompt_tokens,
+                tools_active=tools_active,
+                vllm_request=vllm_request,
+                parser=parser,
             ),
             media_type="text/event-stream",
         )
@@ -427,14 +597,39 @@ async def chat_completions(body: ChatCompletionRequest):
     final_text = ""
     completion_tokens = 0
     async for output in engine.generate(prompt, sampling_params, request_id):
-        final_text = _normalize_completion(output.outputs[0].text)
+        final_text = output.outputs[0].text
         completion_tokens = len(output.outputs[0].token_ids)
+
+    prepared_text = _prepare_model_output(final_text, tools_active=tools_active)
+    if tools_active and parser is not None and vllm_request is not None:
+        extracted = parser.extract_tool_calls(prepared_text, vllm_request)
+        if extracted.tools_called:
+            return JSONResponse(
+                _chat_completion_object(
+                    request_id=request_id,
+                    model=body.model,
+                    content=extracted.content,
+                    tool_calls=extracted.tool_calls,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    finish_reason="tool_calls",
+                )
+            )
+        return JSONResponse(
+            _chat_completion_object(
+                request_id=request_id,
+                model=body.model,
+                content=extracted.content or prepared_text,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+        )
 
     return JSONResponse(
         _chat_completion_object(
             request_id=request_id,
             model=body.model,
-            content=final_text,
+            content=prepared_text,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
@@ -448,25 +643,68 @@ async def _stream_chat_completion(
     request_id: str,
     model: str,
     prompt_tokens: int,
+    tools_active: bool,
+    vllm_request: VllmChatCompletionRequest | None,
+    parser: Any | None,
 ) -> AsyncGenerator[str, None]:
     assert engine is not None
 
     previous_text = ""
+    previous_token_ids: list[int] = []
+    sent_role = False
+    saw_tool_calls = False
+
     async for output in engine.generate(prompt, sampling_params, request_id):
-        current_text = _normalize_completion(output.outputs[0].text)
-        delta = current_text[len(previous_text) :]
-        previous_text = current_text
-        if delta:
+        current_text = _prepare_model_output(
+            output.outputs[0].text,
+            tools_active=tools_active,
+        )
+        current_token_ids = list(output.outputs[0].token_ids)
+        delta_text = current_text[len(previous_text) :]
+        delta_token_ids = current_token_ids[len(previous_token_ids) :]
+
+        if tools_active and parser is not None and vllm_request is not None:
+            delta_message = parser.extract_tool_calls_streaming(
+                previous_text=previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+                previous_token_ids=previous_token_ids,
+                current_token_ids=current_token_ids,
+                delta_token_ids=delta_token_ids,
+                request=vllm_request,
+            )
+            if delta_message is not None:
+                if delta_message.tool_calls:
+                    saw_tool_calls = True
+                delta_payload = _delta_message_to_openai(delta_message)
+                if delta_payload:
+                    if not sent_role:
+                        delta_payload.setdefault("role", "assistant")
+                        sent_role = True
+                    yield _stream_chunk(
+                        request_id=request_id,
+                        model=model,
+                        delta=delta_payload,
+                    )
+        elif delta_text:
+            delta_payload = {"content": delta_text}
+            if not sent_role:
+                delta_payload["role"] = "assistant"
+                sent_role = True
             yield _stream_chunk(
                 request_id=request_id,
                 model=model,
-                delta_content=delta,
+                delta=delta_payload,
             )
 
+        previous_text = current_text
+        previous_token_ids = current_token_ids
+
+    finish_reason = "tool_calls" if saw_tool_calls else "stop"
     yield _stream_chunk(
         request_id=request_id,
         model=model,
-        delta_content=None,
-        finish_reason="stop",
+        delta={},
+        finish_reason=finish_reason,
     )
     yield "data: [DONE]\n\n"
