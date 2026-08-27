@@ -133,11 +133,19 @@ def _create_engine() -> AsyncLLMEngine:
     ]
     if auto_fit and requested != -1:
         attempts.append(("auto-fit", -1, gpu_mem))
-        if not _env_explicit("GPU_MEMORY_UTILIZATION") and gpu_mem < 0.95:
-            attempts.append(("auto-fit", -1, 0.95))
+    # Step down GPU reservation if VRAM headroom is tight (common on 16GB cards).
+    for mem_frac in (0.90, 0.85, 0.80):
+        if mem_frac < gpu_mem:
+            attempts.append(("low-mem", requested if requested != -1 else -1, mem_frac))
+            break
 
     last_error: Exception | None = None
+    seen: set[tuple[int, float]] = set()
     for label, max_len, mem_frac in attempts:
+        key = (max_len, round(mem_frac, 3))
+        if key in seen:
+            continue
+        seen.add(key)
         logger.info(
             "Starting engine (%s): max_model_len=%s gpu_memory_utilization=%.2f "
             "kv_offloading_size=%.1f GiB",

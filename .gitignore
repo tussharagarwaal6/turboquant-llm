@@ -34,6 +34,9 @@ browser/.env
 *.tar.gz
 models/
 checkpoints/
+media/*
+!media/.gitkeep
+.webui_secret_key
 *.safetensors
 *.bin
 *.pt

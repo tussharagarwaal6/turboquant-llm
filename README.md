@@ -149,6 +149,122 @@ curl -N -X POST http://localhost:8000/v1/chat/completions `
 
 Works with Open WebUI, Chatbox, Jan, Continue, etc.
 
+## Multimodal model (images + video + text)
+
+A separate server serves **Qwen2.5-VL-7B-Instruct-AWQ** via vLLM's built-in OpenAI API on **port 8001**. It handles text, images, and video natively. It does **not** use TurboQuant.
+
+**VRAM:** only one server can run at a time on the RTX 5080. Stop the text server first:
+
+```bash
+bash scripts/kill_gpu.sh
+```
+
+### Download (one-time, WSL2)
+
+```bash
+source ~/turboquant-llm/.venv/bin/activate
+hf download Qwen/Qwen2.5-VL-7B-Instruct-AWQ
+```
+
+Approximate size: **~6.9 GB**.
+
+### Launch
+
+```bash
+cd /mnt/c/dev/turboquant-llm
+bash scripts/serve_vl.sh --context 16384
+```
+
+**Windows one-liner:**
+
+```powershell
+wsl -d Ubuntu bash -c "cd /mnt/c/dev/turboquant-llm && bash scripts/serve_vl.sh --context 16384"
+```
+
+Defaults: `MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct-AWQ`, `SERVED_MODEL_NAME=qwen2.5-vl`, port **8001**, `awq_marlin` quantization (required on sm_120).
+
+Place local media under `media/` and reference with `file:///mnt/c/dev/turboquant-llm/media/yourfile.jpg`.
+
+### Verification
+
+```bash
+python scripts/check_vl.py
+```
+
+**From Windows PowerShell:**
+
+```powershell
+curl http://localhost:8001/v1/models
+```
+
+```powershell
+curl -X POST http://localhost:8001/v1/chat/completions `
+  -H "Content-Type: application/json" `
+  -d '{"model":"qwen2.5-vl","messages":[{"role":"user","content":[{"type":"text","text":"What is in this image?"},{"type":"image_url","image_url":{"url":"https://placehold.co/320x240.jpg"}}]}],"max_tokens":128}'
+```
+
+```powershell
+curl -X POST http://localhost:8001/v1/chat/completions `
+  -H "Content-Type: application/json" `
+  -d '{"model":"qwen2.5-vl","messages":[{"role":"user","content":[{"type":"text","text":"What happens in this video?"},{"type":"video_url","video_url":{"url":"https://samplelib.com/lib/preview/mp4/sample-5s.mp4"}}]}],"max_tokens":128}'
+```
+
+### Connect clients to the multimodal server
+
+| Setting | Value |
+|---------|-------|
+| Base URL / API URL | `http://localhost:8001/v1` |
+| API Key | any non-empty string (e.g. `local`) |
+| Model | `qwen2.5-vl` |
+
+For Open WebUI, point `OPENAI_API_BASE_URL` at `:8001/v1` instead of `:8000`.
+
+**Cursor tunnel:** `PORT=8001 bash scripts/tunnel.sh` — then set Base URL to `<tunnel-host>/v1` and model `qwen2.5-vl`.
+
+### Performance
+
+Expected throughput on WSL2 + RTX 5080 (after warm-up):
+
+| Workload | Typical decode speed |
+|----------|---------------------|
+| Text only | ~10–15 tok/s |
+| Text + image | ~5–10 tok/s |
+
+Run a local benchmark (bypasses Cursor tunnel latency):
+
+```bash
+python scripts/bench_vl.py
+```
+
+Tuning knobs (all via env on `serve_vl.sh`):
+
+```bash
+# More VRAM for KV cache, single-user Cursor (0.95 may fail on WSL2 — use 0.92)
+GPU_MEMORY_UTILIZATION=0.92 MAX_NUM_SEQS=1 bash scripts/serve_vl.sh
+
+# Faster text + small images (disables video profiling)
+PERF_PROFILE=speed bash scripts/serve_vl.sh
+
+# Fix stale torch compile cache if startup logs show cubin reload errors
+CLEAR_VLLM_COMPILE_CACHE=1 bash scripts/serve_vl.sh
+```
+
+**WSL2 tip:** add `vmIdleTimeout=-1` to `%UserProfile%\.wslconfig` so WSL does not idle-shutdown mid-session.
+
+**Hard limit:** `VLLM_USE_V2_MODEL_RUNNER=0` is required on WSL2 (no UVA). Native Linux would be ~10–20% faster. If local `bench_vl.py` is fast but Cursor feels slow, the Cloudflare tunnel is the bottleneck — not GPU allocation.
+
+### Multimodal troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| CUDA OOM at startup | Lower `MM_PROCESSOR_KWARGS` max_pixels; try `ENFORCE_EAGER=1 bash scripts/serve_vl.sh` |
+| `awq` / float16 error on sm_120 | Script uses `awq_marlin` by default — do not pass `--quantization awq` |
+| Video works but KV cache is tiny | Defaults cap video profiling; set `LIMIT_MM` video count to 0 if you only need images |
+| Attention backend errors | Try `ATTENTION_BACKEND=TRITON_ATTN bash scripts/serve_vl.sh` |
+| `tool_choice "auto" requires --enable-auto-tool-choice` | Enabled by default in `serve_vl.sh`; restart server after pulling latest script |
+| Slow responses in Cursor but fast locally | Tunnel adds RTT; run `python scripts/bench_vl.py` on localhost first |
+| Unstable tok/s / cubin reload warnings at startup | `CLEAR_VLLM_COMPILE_CACHE=1 bash scripts/serve_vl.sh` |
+
 ## Troubleshooting
 
 | Symptom | Fix |
