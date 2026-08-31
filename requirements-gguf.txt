@@ -1,0 +1,9 @@
+# Optional: GGUF model support via vLLM out-of-tree plugin.
+# Install after requirements.txt:
+#   pip install -r requirements-gguf.txt
+#
+# Note: Qwythos (qwen3_5 GGUF) is not loadable on vllm-gguf-plugin 0.0.5 yet.
+# Default deployment uses llama.cpp via scripts/serve_qwythos.sh.
+# Requires vLLM >= 0.18.0 (see requirements.txt).
+
+vllm-gguf-plugin>=0.0.5

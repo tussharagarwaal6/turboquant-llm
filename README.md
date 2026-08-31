@@ -211,6 +211,104 @@ If you see `{"detail":"Method Not Allowed"}`, you hit the endpoint without `-X P
 
 Works with Open WebUI, Chatbox, Jan, Continue, etc.
 
+## Qwythos-9B GGUF (vision + reasoning + tools on :8000)
+
+Alternative to Qwen3 on the **same port** (`8000`). Uses [empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF](https://huggingface.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF) via **llama.cpp** (default) or experimental **vLLM + vllm-gguf-plugin**. Supports **text, images (OCR/describe), reasoning, and tool calling**. Does **not** use TurboQuant.
+
+**Note:** vLLM GGUF currently fails with `Unknown gguf model_type: qwen3_5` on plugin 0.0.5. The default `serve_qwythos.sh` uses **llama.cpp**, which is the [official model-card path](https://huggingface.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF) for vision.
+
+**VRAM:** only one `:8000` server at a time — Qwen3 **or** Qwythos, not both.
+
+### One-time setup (WSL2)
+
+```bash
+source ~/turboquant-llm/.venv/bin/activate
+pip install -r requirements-gguf.txt   # optional; only for QWYTHOS_RUNTIME=vllm experiments
+bash scripts/download_qwythos.sh
+```
+
+Install llama.cpp (one-time, if not already installed):
+
+```bash
+curl -LsSf https://llama.app/install.sh | sh
+```
+
+Downloads ~6.5 GB (Q4_K_M + mmproj vision encoder).
+
+### Launch
+
+```bash
+bash scripts/kill_gpu.sh
+bash scripts/serve_qwythos.sh --context 16384
+```
+
+**1M context** (YaRN baked into GGUF; uses CPU RAM for KV offload — needs substantial system RAM):
+
+On a **64 GB** host, raise WSL memory first (one-time). Create or edit `%UserProfile%\.wslconfig`:
+
+```ini
+[wsl2]
+memory=56GB
+swap=16GB
+```
+
+Then restart WSL (closes all WSL terminals):
+
+```powershell
+wsl --shutdown
+```
+
+Re-open Ubuntu, then:
+
+```bash
+bash scripts/kill_gpu.sh
+bash scripts/serve_qwythos.sh --context 1048576
+```
+
+Startup may take several minutes while the KV cache is allocated.
+
+**Switch back to Qwen3:**
+
+```bash
+bash scripts/switch_model.sh qwen --context 32768
+```
+
+Or use the helper:
+
+```bash
+bash scripts/switch_model.sh qwythos --context 16384
+bash scripts/switch_model.sh qwen --context 32768
+```
+
+### Connect Open WebUI (same URL as Qwen3)
+
+| Setting | Value |
+|---------|-------|
+| Base URL / API URL | `http://localhost:8000/v1` |
+| API Key | any non-empty string (e.g. `local`) |
+| Model | `qwythos-9b` |
+
+Refresh models in Admin after starting Qwythos. Attach images in chat via **+** for describe/OCR.
+
+### Verification
+
+```bash
+python scripts/check_qwythos.py
+```
+
+Recommended sampling (from model card): temperature 0.6, top_p 0.95, top_k 20. Reasoning may appear in a `reasoning` field.
+
+### Qwythos troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `Missing GGUF` on startup | Run `bash scripts/download_qwythos.sh` |
+| GGUF load / weight mapping error | vLLM path blocked for qwen3_5 today; use default llama.cpp (`bash scripts/serve_qwythos.sh`) |
+| Try experimental vLLM GGUF | `QWYTHOS_RUNTIME=vllm bash scripts/serve_qwythos.sh` (may fail until plugin adds Qwen3.5) |
+| Model can't see images | Ensure mmproj is in the same folder as the text GGUF (`~/models/qwythos/`) |
+| Open WebUI ignores images | Confirm model is `qwythos-9b`, not `Qwen/Qwen3-14B-AWQ` (text-only) |
+| vLLM GGUF unstable | Default runtime is llama.cpp; see `scripts/serve_qwythos_llama.sh` |
+
 ## Multimodal model (images + video + text)
 
 A separate server serves **Qwen2.5-VL-7B-Instruct-AWQ** via vLLM's built-in OpenAI API on **port 8001**. It handles text, images, and video natively. It does **not** use TurboQuant.
