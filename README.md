@@ -309,6 +309,38 @@ Recommended sampling (from model card): temperature 0.6, top_p 0.95, top_k 20. R
 | Open WebUI ignores images | Confirm model is `qwythos-9b`, not `Qwen/Qwen3-14B-AWQ` (text-only) |
 | vLLM GGUF unstable | Default runtime is llama.cpp; see `scripts/serve_qwythos_llama.sh` |
 
+### Context compaction (auto-summarize when near limit)
+
+When a chat approaches the model context window, older turns are **summarized** and replaced with a `[CONVERSATION SUMMARY]` message so the conversation can continue without hitting the token cap.
+
+**Qwythos (llama.cpp):** enabled by default. `serve_qwythos_llama.sh` starts llama on `:8002` and a lightweight proxy on `:8000` that compacts before forwarding.
+
+```bash
+# Default — compaction on (Open WebUI still uses :8000)
+bash scripts/serve_qwythos.sh --context 32768
+
+# Disable compaction
+ENABLE_CONTEXT_COMPACTION=0 bash scripts/serve_qwythos.sh --context 32768
+```
+
+**TurboQuant Qwen3 (`app/server.py`):** compaction runs inside the vLLM server before each request (no extra proxy).
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ENABLE_CONTEXT_COMPACTION` | `1` | Turn compaction on/off |
+| `CONTEXT_COMPACTION_THRESHOLD_RATIO` | `0.85` | Compact when prompt exceeds this fraction of max context |
+| `CONTEXT_COMPACTION_RETENTION_PERCENT` | `40` | Keep the newest ~40% of non-system messages verbatim |
+| `CONTEXT_COMPACTION_MAX_SUMMARY_TOKENS` | `1024` | Max tokens for the summary generation call |
+| `CONTEXT_COMPACTION_RESERVE_TOKENS` | `512` | Headroom below threshold before triggering |
+| `ENABLE_TOOL_PRUNING` | `1` | Collapse completed tool turns into compact `[TOOL RESULT]` messages |
+| `TOOL_PRUNE_MAX_RESULT_CHARS` | `2000` | Max chars kept per tool result after pruning |
+
+**Tool pruning:** after a tool runs, the proxy/server replaces `assistant(tool_calls) + tool(result)` with a short `[TOOL RESULT: tool_name]` user message containing only the useful answer text. This saves context while keeping tool calling working. The active in-flight tool turn is left intact.
+
+Compaction adds one extra model call when it runs (summary generation). Open WebUI RAG still injects retrieved chunks separately — compaction only affects the chat history sent to the model.
+
+**Image OCR in Open WebUI:** pair with the [open-webui](https://github.com/tussharagarwaal6/openwebui) **Image OCR** tool (`tools/image_ocr_tool.py`), which calls Qwythos vision for chat image text extraction. PDF/scanned-document OCR still uses Tika in Open WebUI Knowledge.
+
 ## Multimodal model (images + video + text)
 
 A separate server serves **Qwen2.5-VL-7B-Instruct-AWQ** via vLLM's built-in OpenAI API on **port 8001**. It handles text, images, and video natively. It does **not** use TurboQuant.

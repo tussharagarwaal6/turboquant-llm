@@ -59,6 +59,13 @@ from vllm.entrypoints.openai.chat_completion.protocol import (  # noqa: E402
 )
 from vllm.tool_parsers import ToolParserManager  # noqa: E402
 
+from app.context_compaction import (  # noqa: E402
+    maybe_compact_messages,
+    prune_tool_messages,
+    should_skip_compaction,
+    summary_max_tokens,
+)
+
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3-14B-AWQ")
 SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL_ID)
 TOOL_CALL_PARSER = os.environ.get("TOOL_CALL_PARSER", "hermes")
@@ -340,6 +347,39 @@ def _message_to_dict(message: ChatMessage) -> dict[str, Any]:
     return payload
 
 
+def _dict_to_chat_message(payload: dict[str, Any]) -> ChatMessage:
+    return ChatMessage.model_validate(payload)
+
+
+async def _summarize_for_compaction(prompt: str) -> str:
+    if engine is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized for compaction")
+
+    summary_messages = [{"role": "user", "content": prompt}]
+    template_kwargs: dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    if not _env_bool("ENABLE_THINKING", False):
+        try:
+            summary_prompt = tokenizer.apply_chat_template(
+                summary_messages,
+                **template_kwargs,
+                enable_thinking=False,
+            )
+        except TypeError:
+            summary_prompt = tokenizer.apply_chat_template(summary_messages, **template_kwargs)
+    else:
+        summary_prompt = tokenizer.apply_chat_template(summary_messages, **template_kwargs)
+
+    params = SamplingParams(temperature=0.3, max_tokens=summary_max_tokens())
+    request_id = f"{uuid.uuid4().hex}-compact"
+    final_text = ""
+    async for output in engine.generate(summary_prompt, params, request_id):
+        final_text = output.outputs[0].text
+    return _prepare_model_output(final_text, tools_active=False)
+
+
 def _tools_enabled(body: ChatCompletionRequest) -> bool:
     return bool(body.tools) and body.tool_choice != "none"
 
@@ -570,6 +610,29 @@ async def chat_completions(body: ChatCompletionRequest):
             status_code=404,
             detail=f"Model '{body.model}' not found. Use '{SERVED_MODEL_NAME}'.",
         )
+
+    message_dicts = [_message_to_dict(message) for message in body.messages]
+    pruned_messages, did_prune = prune_tool_messages(
+        message_dicts,
+        active_tool_request=bool(body.tools),
+    )
+    if did_prune:
+        message_dicts = pruned_messages
+        body = body.model_copy(
+            update={"messages": [_dict_to_chat_message(message) for message in pruned_messages]}
+        )
+
+    if not should_skip_compaction({"messages": message_dicts, "tools": body.tools}):
+        compacted_messages, did_compact = await maybe_compact_messages(
+            message_dicts,
+            max_model_len=effective_max_model_len,
+            tokenizer=tokenizer,
+            summarize=_summarize_for_compaction,
+        )
+        if did_compact:
+            body = body.model_copy(
+                update={"messages": [_dict_to_chat_message(message) for message in compacted_messages]}
+            )
 
     tools_active = _tools_enabled(body)
     prompt = _messages_to_prompt(body)

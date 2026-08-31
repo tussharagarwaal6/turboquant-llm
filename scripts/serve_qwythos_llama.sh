@@ -13,6 +13,7 @@
 set -euo pipefail
 
 APP_DIR=/mnt/c/dev/turboquant-llm
+VENV="${VENV:-$HOME/turboquant-llm/.venv}"
 export MODEL_DIR="${MODEL_DIR:-$HOME/models/qwythos}"
 export TEXT_GGUF="${TEXT_GGUF:-Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf}"
 export MMPROJ_GGUF="${MMPROJ_GGUF:-mmproj-Qwythos-9B-Claude-Mythos-5-1M-F16.gguf}"
@@ -24,6 +25,8 @@ export LLAMA_BIN="${LLAMA_BIN:-$HOME/.local/bin/llama}"
 export N_GPU_LAYERS="${N_GPU_LAYERS:--1}"
 export PARALLEL="${PARALLEL:-}"
 export CACHE_RAM="${CACHE_RAM:-}"
+export ENABLE_CONTEXT_COMPACTION="${ENABLE_CONTEXT_COMPACTION:-1}"
+export BACKEND_PORT="${BACKEND_PORT:-8002}"
 
 # Qwythos GGUF ships YaRN for up to 1,048,576 tokens (see model card).
 export MAX_CTX="${MAX_CTX:-1048576}"
@@ -42,6 +45,8 @@ Options:
 Environment:
   PARALLEL=1                 Recommended for 1M (single slot)
   CACHE_RAM=-1               No RAM cap on prompt/KV cache (needed for long ctx)
+  ENABLE_CONTEXT_COMPACTION=1  Summarize old turns when context nears limit (default on)
+  BACKEND_PORT=8002          llama.cpp port when compaction proxy listens on PORT
 
 Prerequisites:
   llama.cpp CLI installed (https://llama.app/install.sh)
@@ -136,18 +141,62 @@ if [[ "$CTX_SIZE" -ge 262144 ]]; then
   echo "  NOTE: 1M-class context uses CPU RAM for KV offload; ensure enough free RAM."
 fi
 
-exec "$LLAMA_BIN" serve \
-  --model "$MODEL_PATH" \
-  --mmproj "$MMPROJ_PATH" \
-  --alias "$SERVED_MODEL_NAME" \
-  --host "$HOST" \
-  --port "$PORT" \
-  --ctx-size "$CTX_SIZE" \
-  --parallel "$PARALLEL" \
-  --cache-ram "$CACHE_RAM" \
-  --n-gpu-layers "$N_GPU_LAYERS" \
-  --temp 0.6 \
-  --top-p 0.95 \
-  --top-k 20 \
-  --repeat-penalty 1.05 \
+_llama_serve_args=(
+  --model "$MODEL_PATH"
+  --mmproj "$MMPROJ_PATH"
+  --alias "$SERVED_MODEL_NAME"
+  --host "$HOST"
+  --ctx-size "$CTX_SIZE"
+  --parallel "$PARALLEL"
+  --cache-ram "$CACHE_RAM"
+  --n-gpu-layers "$N_GPU_LAYERS"
+  --temp 0.6
+  --top-p 0.95
+  --top-k 20
+  --repeat-penalty 1.05
   --reasoning-preserve
+)
+
+_wait_for_backend() {
+  local url="http://127.0.0.1:${BACKEND_PORT}/v1/models"
+  local attempt
+  for attempt in $(seq 1 120); do
+    if curl -sf "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Timed out waiting for llama.cpp on port $BACKEND_PORT" >&2
+  return 1
+}
+
+_compaction_enabled() {
+  case "${ENABLE_CONTEXT_COMPACTION,,}" in
+    0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+if _compaction_enabled; then
+  echo "  ENABLE_CONTEXT_COMPACTION=1 (proxy :$PORT -> llama :$BACKEND_PORT)"
+  export COMPACTION_BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}/v1"
+  export MAX_MODEL_LEN="$CTX_SIZE"
+
+  "$LLAMA_BIN" serve \
+    "${_llama_serve_args[@]}" \
+    --port "$BACKEND_PORT" &
+  LLAMA_PID=$!
+  trap 'kill "$LLAMA_PID" 2>/dev/null || true' EXIT
+
+  if ! _wait_for_backend; then
+    kill "$LLAMA_PID" 2>/dev/null || true
+    exit 1
+  fi
+
+  cd "$APP_DIR" || exit 1
+  exec "$VENV/bin/python" -m uvicorn app.compaction_proxy:app --host "$HOST" --port "$PORT"
+fi
+
+exec "$LLAMA_BIN" serve \
+  "${_llama_serve_args[@]}" \
+  --port "$PORT"
