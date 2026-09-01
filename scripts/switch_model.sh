@@ -1,5 +1,5 @@
 #!/bin/bash
-# Switch between Qwen3 TurboQuant and Qwythos GGUF on port 8000.
+# Switch between Qwen3 TurboQuant, Qwythos GGUF, and KAT-Coder EXL3 on port 8000.
 set -euo pipefail
 
 APP_DIR=/mnt/c/dev/turboquant-llm
@@ -12,10 +12,12 @@ Usage: switch_model.sh MODEL [SERVE_ARGS...]
 MODEL:
   qwen      Start Qwen3-14B-AWQ + TurboQuant (serve.sh)
   qwythos   Start Qwythos-9B GGUF + vision (serve_qwythos.sh)
+  kat       Start KAT-Coder EXL3 via TabbyAPI (serve_kat.sh)
 
 Examples:
   bash scripts/switch_model.sh qwen --context 32768
   bash scripts/switch_model.sh qwythos --context 16384
+  bash scripts/switch_model.sh kat --context 16384
 EOF
 }
 
@@ -37,6 +39,10 @@ case "$MODEL" in
   qwythos|qwy)
     echo "Starting Qwythos GGUF on :8000 ..."
     exec bash scripts/serve_qwythos.sh "$@"
+    ;;
+  kat|kat-coder)
+    echo "Starting KAT-Coder EXL3 (TabbyAPI) on :8000 ..."
+    exec bash scripts/serve_kat.sh "$@"
     ;;
   -h|--help|help)
     usage

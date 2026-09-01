@@ -1,0 +1,18 @@
+# Long-context TabbyAPI overrides (~200k). Uses CPU/system RAM — not Intel GPU.
+# EXL3 + TabbyAPI only supports NVIDIA CUDA for compute.
+model:
+  backend: exllamav3
+  max_seq_len: 199936
+  cache_size: 199936
+  cache_mode: Q8
+  gpu_split_auto: true
+  autosplit_reserve: [256]
+  max_batch_size: 1
+  chunk_size: 512
+  output_chunking: true
+  tool_format: qwen3_coder
+  cpu_moe_split_experts: 192
+  cpu_moe_threads: 8
+
+draft_model:
+  draft_mode: disabled

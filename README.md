@@ -341,6 +341,89 @@ Compaction adds one extra model call when it runs (summary generation). Open Web
 
 **Image OCR in Open WebUI:** pair with the [open-webui](https://github.com/tussharagarwaal6/openwebui) **Image OCR** tool (`tools/image_ocr_tool.py`), which calls Qwythos vision for chat image text extraction. PDF/scanned-document OCR still uses Tika in Open WebUI Knowledge.
 
+## KAT-Coder-V2.5-Dev EXL3 (TabbyAPI on :8000)
+
+Agentic coding model served from [P4pps3n/KAT-Coder-V2.5-Dev-MTP-exl3-5bpw-hq](https://huggingface.co/P4pps3n/KAT-Coder-V2.5-Dev-MTP-exl3-5bpw-hq) (~24 GB EXL3, 5.08 bpw + MTP draft head).
+
+**Important:** This checkpoint is **EXL3 for ExLlamaV3**, not AWQ/NVFP4. It **cannot** use the vLLM TurboQuant server (`turboquant_k8v4`). Instead it runs via **TabbyAPI** with **Q8 KV cache** (ExLlamaV3’s KV compression). Tool format: `qwen3_coder`.
+
+**VRAM:** only one `:8000` server at a time — Qwen3, Qwythos, **or** KAT. The quantizer recommends **2×24 GB**; on a **16 GB** RTX 5080 we offload MoE experts to CPU and start with `--context 8192`–`16384`.
+
+### One-time setup (WSL2)
+
+```bash
+hf download P4pps3n/KAT-Coder-V2.5-Dev-MTP-exl3-5bpw-hq
+bash scripts/setup_tabbyapi.sh
+```
+
+Weights are read from the Windows HF cache (`/mnt/c/Users/.../.cache/huggingface/hub/...`).
+
+### Launch
+
+```bash
+bash scripts/kill_gpu.sh
+bash scripts/switch_model.sh kat --context 16384
+```
+
+Startup may take several minutes while ~24 GB loads.
+
+Verify:
+
+```bash
+curl http://localhost:8000/v1/models
+MODEL=KAT-Coder-V2.5-Dev-MTP-exl3-5bpw-hq bash scripts/test_tool_call.sh
+```
+
+**Switch back:**
+
+```bash
+bash scripts/switch_model.sh qwen --context 32768
+bash scripts/switch_model.sh qwythos --context 16384
+```
+
+### Connect Open WebUI
+
+| Setting | Value |
+|---------|-------|
+| Base URL / API URL | `http://localhost:8000/v1` |
+| API Key | any non-empty string (e.g. `local`) |
+| Model | `KAT-Coder-V2.5-Dev-MTP-exl3-5bpw-hq` |
+
+For reasoning, enable thinking in the request (`enable_thinking: true`). Default server config disables thinking for cleaner tool use.
+
+### Long context (~200k)
+
+**Intel GPU offload is not supported.** TabbyAPI/ExLlamaV3 uses **NVIDIA CUDA only** — there is no path to run this EXL3 checkpoint on Intel iGPU/Arc.
+
+For ~200k context, the server spills KV pages to **system RAM** (not Intel GPU):
+
+```bash
+bash scripts/switch_model.sh kat --context 200000
+```
+
+This rounds to **199936** tokens (TabbyAPI requires multiples of 256), enables `cpu_moe_split_experts`, disables MTP drafting to save VRAM, and sets `sysmem_kv_cache=16384` MiB. Override spill size:
+
+```bash
+SYSMEM_KV_CACHE=32768 bash scripts/serve_kat.sh --context 200000
+```
+
+You have **54 GB WSL RAM** — enough in theory (~24 GB weights + ~8 GB Q8 KV at 200k), but startup will be **slow** and may still OOM on a 16 GB laptop GPU. The model card validated 258k on **2× RTX 3090 24 GB**, not a single 16 GB card.
+
+If 200k fails on EXL3, alternatives are:
+
+- Use **Qwythos** with `--context 200000` (llama.cpp CPU/GPU hybrid, already in this repo)
+- Download a **GGUF** KAT build and run via llama.cpp with `-c 200000` (different weights, not your EXL3 file)
+
+### KAT troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `TabbyAPI not installed` | Run `bash scripts/setup_tabbyapi.sh` |
+| Missing weights | `hf download P4pps3n/KAT-Coder-V2.5-Dev-MTP-exl3-5bpw-hq` |
+| OOM on 16 GB | Lower context: `bash scripts/switch_model.sh kat --context 8192` |
+| Slow on long context | Expected; model card tested up to 258k on 2×3090 with Q8 KV |
+| Wanted vLLM TurboQuant | Not supported for EXL3 — use Qwen3 (`switch_model.sh qwen`) for TurboQuant |
+
 ## Multimodal model (images + video + text)
 
 A separate server serves **Qwen2.5-VL-7B-Instruct-AWQ** via vLLM's built-in OpenAI API on **port 8001**. It handles text, images, and video natively. It does **not** use TurboQuant.
