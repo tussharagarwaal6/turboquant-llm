@@ -1,0 +1,19 @@
+# Cursor/VS Code read this on save. WSL bash scripts break on CRLF.
+root = true
+
+[*]
+charset = utf-8
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{sh,bash}]
+end_of_line = lf
+
+[scripts/**]
+end_of_line = lf
+
+[*.{py,yml,yaml,json,md,toml}]
+end_of_line = lf
+
+[*.{ps1,bat,cmd}]
+end_of_line = crlf

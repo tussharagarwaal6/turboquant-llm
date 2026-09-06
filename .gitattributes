@@ -1,3 +1,11 @@
+# WSL/bash scripts must stay LF or you get: set: pipefail: invalid option name
 *.sh text eol=lf
-browser/** text eol=lf
+*.bash text eol=lf
 scripts/** text eol=lf
+browser/** text eol=lf
+*.py text eol=lf
+
+# Windows-native scripts
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf

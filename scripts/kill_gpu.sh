@@ -10,18 +10,23 @@ pkill -f 'vllm serve' 2>/dev/null || true
 pkill -f 'llama serve' 2>/dev/null || true
 pkill -f 'llama-server' 2>/dev/null || true
 pkill -f '/\.local/bin/llama' 2>/dev/null || true
-pkill -f 'tabbyAPI/main.py' 2>/dev/null || true
+pkill -f 'llamacpp-cuda/build/bin/llama-server' 2>/dev/null || true
+# TabbyAPI runs as `python main.py --config <dir>/tabbyAPI/config.yml`, so the
+# repo name only ever appears in the --config argument.
+pkill -f 'tabbyAPI' 2>/dev/null || true
 pkill -f 'EngineCore' 2>/dev/null || true
 pkill -f 'VllmWorker' 2>/dev/null || true
 sleep 2
 
-REMAINING=$(pgrep -af 'uvicorn app.server|uvicorn app.compaction_proxy|vllm serve|llama serve|tabbyAPI/main.py|EngineCore|VllmWorker' || true)
+REMAINING=$(pgrep -af 'uvicorn app.server|uvicorn app.compaction_proxy|vllm serve|llama serve|llamacpp-cuda/build/bin/llama-server|tabbyAPI|EngineCore|VllmWorker' || true)
 if [ -n "$REMAINING" ]; then
   echo "Force-killing remaining processes..."
   pkill -9 -f 'uvicorn app.server' 2>/dev/null || true
   pkill -9 -f 'uvicorn app.compaction_proxy' 2>/dev/null || true
   pkill -9 -f 'vllm serve' 2>/dev/null || true
   pkill -9 -f 'llama serve' 2>/dev/null || true
+  pkill -9 -f 'llamacpp-cuda/build/bin/llama-server' 2>/dev/null || true
+  pkill -9 -f 'tabbyAPI' 2>/dev/null || true
   pkill -9 -f 'EngineCore' 2>/dev/null || true
   pkill -9 -f 'VllmWorker' 2>/dev/null || true
   sleep 1

@@ -424,6 +424,237 @@ If 200k fails on EXL3, alternatives are:
 | Slow on long context | Expected; model card tested up to 258k on 2×3090 with Q8 KV |
 | Wanted vLLM TurboQuant | Not supported for EXL3 — use Qwen3 (`switch_model.sh qwen`) for TurboQuant |
 
+## KAT-Coder GGUF + speculative decoding (`kat-npu` on :8000)
+
+A second, **additive** way to serve KAT: GGUF on llama.cpp instead of EXL3 on TabbyAPI, so that
+**speculative decoding** can be used to offset the cost of CPU MoE offload. The EXL3 path above is
+untouched — `switch_model.sh kat` still works exactly as before.
+
+Trunk: [offmonreal/KAT-Coder-V2.5-Dev-MaxQuality-MTP-GGUF](https://huggingface.co/offmonreal/KAT-Coder-V2.5-Dev-MaxQuality-MTP-GGUF)
+(`KAT-Coder-V2.5-Dev_Q3_K_M_imatrix_MTP.gguf`, 18.1 GB). The `_MTP` suffix matters: this file has the
+MTP draft head **bundled** as a 41st block, so drafting needs no second model file.
+
+### Launch
+
+```bash
+bash scripts/link_kat_gguf.sh          # one-time; symlinks, downloads nothing
+bash scripts/switch_model.sh kat-npu --context 16384
+```
+
+Startup takes a few minutes: 18 GB is read from the Windows filesystem over `drvfs`.
+
+### Speculation modes
+
+Selected with `SPEC_MODE` (or `--spec-mode`):
+
+| Mode | What drafts | Needs |
+|------|-------------|-------|
+| `cuda` (default) | Bundled MTP head, on the RTX 5080 | nothing extra |
+| `none` | Nothing; plain decode | nothing extra |
+| `npu` | Separate MTP head on the Intel NPU, over RPC | Windows drafter + RPC build |
+
+```bash
+SPEC_MODE=none bash scripts/switch_model.sh kat-npu     # baseline
+bash scripts/bench_kat_npu.sh                            # compare modes
+```
+
+`bench_kat_npu.sh` cold-starts the server once per configuration, sends a fixed coding prompt, and
+writes prompt-eval tok/s, decode tok/s, and draft acceptance to `.bench_kat_npu.tsv`. It sweeps
+`SPEC_N_SWEEP` (draft depth) and `MOE_SWEEP` (`--n-cpu-moe`), and skips `npu` automatically when the
+drafter is not reachable. Keep a speculation mode only if it beats `none`.
+
+`PROFILE=short|long|max` selects a context size (8k / 100k / 200k), a prompt length to measure at,
+and an `--n-cpu-moe` range that brackets the optimum for that context:
+
+```bash
+PROFILE=long REPEATS=5 bash scripts/bench_kat_npu.sh
+PROFILE=max MODES=cuda CACHE_TYPE_K=q4_0 CACHE_TYPE_V=q4_0 bash scripts/bench_kat_npu.sh
+```
+
+Two details matter when reading its output. Decode tok/s swings by several tok/s between identical
+requests, because this GPU also drives the Windows desktop — hence `REPEATS` and a median column
+rather than single samples. And `PROMPT_TOKENS` prepends filler so decode is measured at a realistic
+KV occupancy; measuring at an empty context flatters every configuration equally.
+
+Measurement goes through `scripts/probe_llama_speed.py`, which also works against an already-running
+server when you just want one number without a cold start:
+
+```bash
+python3 scripts/probe_llama_speed.py --prompt-tokens 16000 --n-predict 256
+```
+
+### Measured result
+
+RTX 5080 16 GB, `--context 8192`, `--n-cpu-moe 16`, Q8 KV, 200-token completion:
+
+| Mode | decode | vs baseline | draft acceptance |
+|------|--------|-------------|------------------|
+| `none` | 22.2 tok/s | — | — |
+| `cuda` (`--spec-draft-n-max 2`) | **32.8 tok/s** | **1.48×** | **82%** (123/150) |
+
+The 82% acceptance rate is the reason this works: KAT ships an MTP head trained against its own
+trunk, so its drafts are almost always right. Model load takes ~1m40s for the 18 GB trunk.
+
+### Long context (100k–200k)
+
+Both 100k and 200k run on the single 16 GB card. The setting that decides whether they are fast or
+unusable is how the model is split between GPU and CPU, not the context length.
+
+Medians of 3–5 repeats, `SPEC_MODE=cuda`, `--spec-draft-n-max 2`, 17.7k-token prompt, 384-token
+completion:
+
+| Context | KV | `--n-cpu-moe` | decode | VRAM used | notes |
+|---------|----|---------------|--------|-----------|-------|
+| 100k | Q8 | auto-fit | 11.1 tok/s | 14.5 GB | previous default |
+| 100k | Q8 | **12** | **19.2 tok/s** | 14.9 GB | recommended |
+| 100k | Q4 | 10 | **21.8 tok/s** | 15.1 GB | fastest at 100k |
+| 200k | Q8 | **16** | **18.5 tok/s** | 15.0 GB | recommended |
+| 200k | Q4 | 12 | **22.0 tok/s** | 15.5 GB | fastest, ~0.8 GB headroom |
+
+Speculation still earns its keep at long context: at 100k with `--n-cpu-moe 12`, `cuda` decodes
+19.2 tok/s against 10.8 tok/s for `none` — **1.8×**, with 73% draft acceptance.
+
+`serve_kat_npu.sh` applies these values automatically from `--context 65536` upward, so the launch is
+just:
+
+```bash
+bash scripts/switch_model.sh kat-npu --context 200000
+```
+
+Set `N_CPU_MOE` or `N_GPU_LAYERS` to override the profile. Contexts below 64k keep the old auto-fit
+behaviour, which is already near-optimal when KV is small.
+
+**Why auto-fit was slow.** `--n-gpu-layers auto` balances its VRAM budget by moving whole layers to
+the CPU, attention included. That is the wrong half to move: only a few experts fire per token, but
+every token needs every attention layer. Keeping all layers on the GPU (`--n-gpu-layers all`) and
+streaming only the MoE experts (`--n-cpu-moe N`) is nearly twice as fast at the same VRAM.
+
+**Where the memory actually goes.** The weights dominate, not the KV cache. Going from 100k to 200k
+costs well under a gigabyte of VRAM, and switching Q8 KV to Q4 frees only ~0.5 GB at 100k. Host RAM
+peaks around 10 GB of resident memory for the parts of the 18 GB trunk kept off the GPU, so the 54 GB
+WSL allocation is never the limit — the 16 GB of VRAM is.
+
+**Leave the card ~1 GB free.** On Windows the driver pages VRAM out to host RAM instead of failing an
+allocation, so an over-full card does not OOM, it just crawls. At `--n-cpu-moe 4` prompt eval fell
+from ~1400 tok/s to **25 tok/s** with no error in the log. `bench_kat_npu.sh` refuses to benchmark a
+configuration leaving less than `SPILL_MARGIN_MIB` (600) free, and reports it as `SPILL`.
+
+**Q4 KV is a real but bounded win.** It buys 2–3 tok/s and costs some KV precision; draft acceptance
+also drops (73% → 65% at 100k). Q8 is the default for that reason — use Q4 when throughput matters
+more than long-range recall.
+
+**Faster cold starts.** With `--load-mode none` the whole trunk is read on every start, and reading
+18 GB from `/mnt/c` over `drvfs` takes ~1m40s. Copying it to ext4 once cuts that to **under 20s**:
+
+```bash
+mkdir -p ~/models/kat-gguf-local
+cp -L ~/models/kat-gguf/KAT-Coder-V2.5-Dev_Q3_K_M_imatrix_MTP.gguf ~/models/kat-gguf-local/
+TARGET_GGUF=~/models/kat-gguf-local/KAT-Coder-V2.5-Dev_Q3_K_M_imatrix_MTP.gguf \
+  bash scripts/serve_kat_npu.sh --context 200000
+```
+
+This changes startup only; steady-state decode is identical, since the weights end up in RAM and
+VRAM either way. It costs ~17 GB of ext4 disk.
+
+**Verified at full depth.** The table above measures decode at a 17.7k-token prompt. A single
+**173,958-token** prompt against `--context 200000` (Q8 KV, `--n-cpu-moe 16`) processes at 832 tok/s
+and then decodes at **15.0 tok/s** with 67% draft acceptance — so the deep end costs roughly 3 tok/s
+against the shallow measurement, not a collapse. VRAM peaked at 15.0 GB and resident host memory at
+8.3 GB, both unchanged from the shallow run: `--ctx-size` reserves the KV cache up front, so a nearly
+full context is no more expensive in memory than an empty one. Budget the prefill, though — 174k
+tokens takes about 3.5 minutes before the first token appears.
+
+### Why the NPU is not the default
+
+The original goal was to draft on the **Intel AI Boost NPU** so drafting would cost no VRAM. It is
+fully implemented and works, but **measurement says do not use it.** Speculative decoding only pays
+off when the drafter is several times *faster* than the target; a drafter slower than the target
+makes generation worse, because every rejected draft is wasted work.
+
+Measured with `llama-bench` on `Qwen3-0.6B-Q4_K_M` (Core Ultra 9 275HX, NPU 3720):
+
+| Device | prefill | **decode** |
+|--------|---------|------------|
+| NPU (`Intel(R) AI Boost`) | 398 t/s | **10.1 t/s** |
+| Intel iGPU (`GPU.0`) | 1128 t/s | **19.8 t/s** |
+
+The KAT trunk itself decodes at 22–33 tok/s on CUDA (table above), so a useful drafter would need to
+sustain roughly **65–100 tok/s**. The NPU manages 10, and the real draft head (1.06 GB) is *larger*
+than the 0.6 B model benchmarked, so it would be slower still — off by about an order of magnitude.
+The NPU is built for prefill: high throughput on large static graphs, but poor autoregressive decode
+because it is bandwidth-limited and runs stateless only. The iGPU fallback fails the same test.
+
+Conclusion: `SPEC_MODE=cuda` (bundled head on the GPU) is the configuration that actually helps, and
+it needs none of the Windows-side setup. `SPEC_MODE=npu` is kept as a working, opt-in experiment.
+
+### Optional: the NPU drafting path
+
+Two processes, started in this order.
+
+**1. Windows — expose the NPU as a drafting device.** One-time build, then leave it running:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_npu_drafter.ps1
+powershell -ExecutionPolicy Bypass -File scripts\npu_drafter.ps1          # or -Device GPU.0
+```
+
+`rpc-server` loads no model; it only exposes an OpenVINO device on TCP 50052, so it can stay up
+across target-model switches.
+
+**2. WSL2 — build llama.cpp with RPC, then serve.** The prebuilt `~/.local/bin/llama` has CUDA and
+all `--spec-*` flags but **no RPC backend**, so the NPU path needs a source build:
+
+```bash
+bash scripts/setup_llamacpp_rpc.sh                  # needs the CUDA toolkit (~3 GB)
+bash scripts/check_npu_rpc.sh                       # verifies RPC0 enumerates
+SPEC_MODE=npu bash scripts/switch_model.sh kat-npu
+```
+
+`check_npu_rpc.sh` reports the Windows host IP, port reachability, and whether `RPC0` appears.
+
+### Notes discovered while building this
+
+- **Draft heads are family-locked.** An MTP head consumes the trunk's final hidden state, so it must
+  match the trunk's embedding length *and* vocab. Verified with `scripts/gguf_compat.py`: both KAT and
+  the Qwen3.6-35B-A3B head are `hidden=2048 vocab=248320`. `serve_kat_npu.sh` runs this check before
+  starting `SPEC_MODE=npu`, because a mismatched head loads fine and then silently drafts tokens that
+  are always rejected. Qwen3.6-**27B** is the counterexample: same 248320 vocab, but `hidden=5120`, so
+  the 35B-A3B head is unusable with it.
+- **The head is not a standalone model.** `llama-cli -m mtp-*.gguf` segfaults on every device. The
+  head is only loadable through `--spec-type draft-mtp` attached to a trunk.
+- **`--ctx-size-draft` does not exist** in current llama.cpp; the draft context follows the target's.
+  Current flag names are `--spec-type`, `--spec-draft-model`, `--spec-draft-device`,
+  `--spec-draft-n-max`. `--draft`/`--draft-max` were removed.
+- **`--no-mmap` is deprecated** in favour of `--load-mode`. The scripts pass `--load-mode none`,
+  which llama.cpp itself recommends when MoE tensors are overridden to CPU.
+- **`--cache-ram` is not KV offload.** It sizes the *host-side prompt cache*, which lets a later
+  request reuse an earlier prompt's KV instead of reprocessing it (the `selected slot by LCP
+  similarity` lines in the log). The active context always lives in VRAM, so context length is a
+  VRAM constraint, not a system-RAM one. Long contexts make each cached state large, hence
+  `--cache-ram -1` past 131072 — otherwise the 8192 MiB default cannot hold even one.
+- **`--n-gpu-layers` takes `auto`, `all`, or a number.** Not `-1` or `999`; the scripts pass `all`.
+- **The OpenVINO backend needs an OpenCL SDK** that Windows does not ship. `setup_npu_drafter.ps1`
+  assembles one from OpenCL-Headers, OpenCL-ICD-Loader, and OpenCL-CLHPP — the last is required
+  because OpenVINO's `ocl_wrapper.hpp` includes `CL/cl2.hpp`, which the Headers repo omits.
+- **`GGML_OPENVINO_CACHE_DIR` is unsupported on the NPU** and setting it crashes model load. The
+  OpenVINO DLLs also ship inside the pip package and must be added to `PATH`, or the process exits
+  immediately with `STATUS_DLL_NOT_FOUND`.
+- The RPC protocol is unauthenticated, so the firewall rule is scoped to the WSL subnet.
+
+### kat-npu troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `couldn't bind HTTP server socket` on :8000 | Another server holds the port: `bash scripts/kill_gpu.sh` |
+| Missing target GGUF | `bash scripts/link_kat_gguf.sh` |
+| `SPEC_MODE=npu needs a llama.cpp build with the RPC backend` | `bash scripts/setup_llamacpp_rpc.sh` |
+| `No RPC server at <ip>:50052` | Start `scripts\npu_drafter.ps1` on Windows; diagnose with `scripts/check_npu_rpc.sh` |
+| `Draft head is INCOMPATIBLE` | Head does not match the trunk; check with `python3 scripts/gguf_compat.py show <file>` |
+| Speculation makes decode slower | Expected for `npu`; use the default `SPEC_MODE=cuda` |
+| Server responds but everything crawls (prompt eval ~25 tok/s), no error | VRAM is full and the driver is paging to host RAM. Raise `N_CPU_MOE` until `nvidia-smi` shows ~1 GB free |
+| Decode much slower than the table above at 100k+ | `N_GPU_LAYERS` is probably `auto`; the long-context profile needs it unset or `all` |
+| `Failed to initialize NVML` in WSL after the host sleeps | The dGPU dropped off the bus; reboot Windows (`wsl --shutdown` alone does not recover it) |
+
 ## Multimodal model (images + video + text)
 
 A separate server serves **Qwen2.5-VL-7B-Instruct-AWQ** via vLLM's built-in OpenAI API on **port 8001**. It handles text, images, and video natively. It does **not** use TurboQuant.
