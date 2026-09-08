@@ -1,5 +1,5 @@
 #!/bin/bash
-# Switch between Qwen3 TurboQuant, Qwythos GGUF, and KAT-Coder (EXL3 or GGUF) on port 8000.
+# Switch between Qwen3 TurboQuant, Qwythos GGUF, KAT-Coder, and Gemma 4 on port 8000.
 set -euo pipefail
 
 APP_DIR=/mnt/c/dev/turboquant-llm
@@ -15,12 +15,14 @@ MODEL:
   kat       Start KAT-Coder EXL3 via TabbyAPI (serve_kat.sh)
   kat-npu   Start KAT-Coder GGUF via llama.cpp with speculative decoding
             (serve_kat_npu.sh; SPEC_MODE=cuda|none|npu, default cuda)
+  gemma4    Start Gemma 4 26B A4B MoE GGUF via llama.cpp + vision (serve_gemma4.sh)
 
 Examples:
   bash scripts/switch_model.sh qwen --context 32768
   bash scripts/switch_model.sh qwythos --context 16384
   bash scripts/switch_model.sh kat --context 16384
   bash scripts/switch_model.sh kat-npu --context 16384
+  bash scripts/switch_model.sh gemma4 --context 100000
   SPEC_MODE=none bash scripts/switch_model.sh kat-npu
 EOF
 }
@@ -51,6 +53,10 @@ case "$MODEL" in
   kat-npu|kat-gguf)
     echo "Starting KAT-Coder GGUF (llama.cpp, SPEC_MODE=${SPEC_MODE:-cuda}) on :8000 ..."
     exec bash scripts/serve_kat_npu.sh "$@"
+    ;;
+  gemma4|gemma)
+    echo "Starting Gemma 4 26B A4B MoE (llama.cpp + vision) on :8000 ..."
+    exec bash scripts/serve_gemma4.sh "$@"
     ;;
   -h|--help|help)
     usage

@@ -655,6 +655,122 @@ SPEC_MODE=npu bash scripts/switch_model.sh kat-npu
 | Decode much slower than the table above at 100k+ | `N_GPU_LAYERS` is probably `auto`; the long-context profile needs it unset or `all` |
 | `Failed to initialize NVML` in WSL after the host sleeps | The dGPU dropped off the bus; reboot Windows (`wsl --shutdown` alone does not recover it) |
 
+## Gemma 4 26B A4B MoE (llama.cpp + vision on :8000)
+
+Multimodal MoE model served from [ggml-org/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF) via **llama.cpp** with `--mmproj`. Same long-context MoE profile as `kat-npu` above; adds **text + image** input (256K native window).
+
+**VRAM:** only one `:8000` server at a time — Qwen3, Qwythos, KAT, **or** Gemma 4. Uses `gemma-4-26B-A4B-it-Q4_0.gguf` (~14.6 GB) + `mmproj-gemma-4-26B-A4B-it-Q8_0.gguf` (~770 MB) so the stack fits a 16 GB RTX 5080 with KV headroom.
+
+### Download (one-time)
+
+```bash
+bash scripts/download_gemma4.sh
+bash scripts/link_gemma4_gguf.sh
+```
+
+Or download on Windows and link only:
+
+```bash
+hf download ggml-org/gemma-4-26B-A4B-it-GGUF \
+  gemma-4-26B-A4B-it-Q4_0.gguf mmproj-gemma-4-26B-A4B-it-Q8_0.gguf
+bash scripts/link_gemma4_gguf.sh
+```
+
+If the primary Q4_0 trunk is missing from cache, `link_gemma4_gguf.sh` falls back to [batiai/Gemma-4-26B-A4B-it-GGUF](https://huggingface.co/batiai/Gemma-4-26B-A4B-it-GGUF) IQ4_XS (~13 GB).
+
+### Launch
+
+```bash
+bash scripts/switch_model.sh gemma4 --context 100000
+```
+
+Context tiers (same tuning as KAT long-context):
+
+| Use case | Command |
+|----------|---------|
+| Fast / short chat | `bash scripts/switch_model.sh gemma4 --context 16384` |
+| RAG / long docs | `bash scripts/switch_model.sh gemma4 --context 100000` |
+| Max tested on 16 GB | `bash scripts/switch_model.sh gemma4 --context 200000` |
+
+From `--context 65536` upward, `serve_gemma4.sh` applies the measured profile automatically: `N_GPU_LAYERS=all`, `--n-cpu-moe 12` (≤100k) or `16` (>100k), Q8 KV, `--load-mode none`.
+
+For maximum decode speed at long context:
+
+```bash
+CACHE_TYPE_K=q4_0 CACHE_TYPE_V=q4_0 N_CPU_MOE=10 \
+  bash scripts/switch_model.sh gemma4 --context 100000
+```
+
+### Verify
+
+```bash
+curl http://localhost:8000/v1/models
+python3 scripts/check_gemma4.py
+python3 scripts/probe_llama_speed.py --model gemma4-26b-a4b --prompt-tokens 16000 --n-predict 256
+```
+
+| Setting | Value |
+|---------|-------|
+| OpenAI base URL | `http://localhost:8000/v1` |
+| Model name | `gemma4-26b-a4b` |
+
+### Multimodal chat
+
+Images via OpenAI-style `image_url` content parts (same as Qwythos):
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma4-26b-a4b",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Extract all visible text from this image."},
+        {"type": "image_url", "image_url": {"url": "https://placehold.co/600x200/png?text=HELLO"}}
+      ]
+    }],
+    "max_tokens": 256
+  }'
+```
+
+Local images: put files in `media/` and use `file:///mnt/c/dev/turboquant-llm/media/photo.png`.
+
+**PDFs:** not a native input — extract text client-side or send page images.
+
+### Switching models
+
+Same pattern as every other `:8000` model: `switch_model.sh` runs `kill_gpu.sh`, then starts the requested server.
+
+```bash
+bash scripts/switch_model.sh gemma4 --context 100000   # multimodal
+bash scripts/switch_model.sh kat-npu --context 100000  # coding + spec decode
+bash scripts/switch_model.sh qwen --context 32768      # TurboQuant text
+```
+
+### Expected performance (RTX 5080 16 GB)
+
+MoE (~3.8B active params/token), no speculative decoding. Same ballpark as `kat-npu` at long context:
+
+| Context | KV | `--n-cpu-moe` | Expected decode |
+|---------|-----|---------------|-----------------|
+| 16K | Q8 | auto | 25–35 tok/s |
+| 100K | Q8 | 12 | 17–22 tok/s |
+| 100K | Q4 | 10 | 20–24 tok/s |
+| 200K | Q8 | 16 | 16–20 tok/s |
+
+### Gemma 4 troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Missing GGUF | `bash scripts/download_gemma4.sh && bash scripts/link_gemma4_gguf.sh` |
+| Trunk OOM on 16 GB | Use batiai IQ4_XS fallback via `link_gemma4_gguf.sh`; set `TARGET_GGUF` / `MMPROJ_GGUF` |
+| Slow decode at 100k+ | Confirm long-context profile: `N_GPU_LAYERS=all`, `N_CPU_MOE=12`; avoid `auto` |
+| VRAM spill / crawl | Raise `N_CPU_MOE` or use `CACHE_TYPE_K/V=q4_0`; leave ~1 GB VRAM free |
+| mmproj dimension mismatch | Use mmproj from the **same** HF repo as the trunk (26B-A4B, not 31B/E4B) |
+| Model ignores images | Confirm server log shows `--mmproj`; use `image_url` content parts |
+| Cold start slow (~2 min) | Copy GGUF to WSL ext4 (see kat-npu section above) |
+
 ## Multimodal model (images + video + text)
 
 A separate server serves **Qwen2.5-VL-7B-Instruct-AWQ** via vLLM's built-in OpenAI API on **port 8001**. It handles text, images, and video natively. It does **not** use TurboQuant.

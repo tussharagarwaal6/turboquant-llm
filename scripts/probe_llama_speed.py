@@ -7,6 +7,7 @@ measured at a realistic KV occupancy instead of a near-empty context.
 
 Usage:
   python3 scripts/probe_llama_speed.py --prompt-tokens 16000 --n-predict 256
+  python3 scripts/probe_llama_speed.py --model gemma4-26b-a4b --prompt-tokens 16000
 """
 
 from __future__ import annotations
