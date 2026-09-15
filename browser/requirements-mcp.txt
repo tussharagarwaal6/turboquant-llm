@@ -1,0 +1,8 @@
+# Browser Use MCP for OpenCode (Windows-side, NOT plain pip).
+#
+# PyPI "mcp-server-browser-use" is a different stdio-only package — do NOT use it.
+# Install Saik0s HTTP daemon instead:
+#
+#   powershell -ExecutionPolicy Bypass -File scripts\install_browser_use_mcp.ps1
+#
+# Source: https://github.com/Saik0s/mcp-browser-use

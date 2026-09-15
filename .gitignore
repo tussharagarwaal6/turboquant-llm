@@ -28,6 +28,9 @@ wheels/
 .env.*
 !.env.example
 browser/.env
+browser/mcp-browser-use/
+browser/mcp-venv/
+browser/chrome-profile/
 
 # Local artifacts
 *.zip

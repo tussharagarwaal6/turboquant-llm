@@ -59,8 +59,16 @@ async def _run(task: str) -> str:
     headless = _env_bool("BROWSER_HEADLESS", False)
     use_vision = _env_bool("BROWSER_USE_VISION", False)
     max_steps = int(_env_str("BROWSER_MAX_STEPS", "25"))
+    cdp_url = _env_str("BROWSER_CDP_URL", "")
 
-    profile = BrowserProfile(headless=headless)
+    profile_kwargs: dict = {"headless": headless}
+    if cdp_url:
+        # Attach to an existing Chrome started with --remote-debugging-port=9222
+        profile_kwargs["cdp_url"] = cdp_url
+        profile_kwargs["is_local"] = True
+        profile_kwargs["keep_alive"] = True
+
+    profile = BrowserProfile(**profile_kwargs)
     agent = Agent(
         task=task,
         llm=_build_llm(),

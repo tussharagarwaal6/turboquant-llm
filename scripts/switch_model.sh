@@ -1,5 +1,6 @@
 #!/bin/bash
-# Switch between Qwen3 TurboQuant, Qwythos GGUF, KAT-Coder, and Gemma 4 on port 8000.
+# Switch between Qwen3 TurboQuant, Qwythos GGUF, KAT-Coder, Gemma 4, Qwen3.5-4B,
+# and Llama 3.3 70B CPU on :8000.
 set -euo pipefail
 
 APP_DIR=/mnt/c/dev/turboquant-llm
@@ -16,6 +17,8 @@ MODEL:
   kat-npu   Start KAT-Coder GGUF via llama.cpp with speculative decoding
             (serve_kat_npu.sh; SPEC_MODE=cuda|none|npu, default cuda)
   gemma4    Start Gemma 4 26B A4B MoE GGUF via llama.cpp + vision (serve_gemma4.sh)
+  qwen35-4b Start Qwen3.5-4B GGUF via llama.cpp, native 262k context (serve_qwen35_4b.sh)
+  llama33   Start Llama 3.3 70B Instruct GGUF via llama.cpp, hybrid GPU+CPU (serve_llama33.sh)
 
 Examples:
   bash scripts/switch_model.sh qwen --context 32768
@@ -23,6 +26,9 @@ Examples:
   bash scripts/switch_model.sh kat --context 16384
   bash scripts/switch_model.sh kat-npu --context 16384
   bash scripts/switch_model.sh gemma4 --context 100000
+  bash scripts/switch_model.sh qwen35-4b --context 262144
+  bash scripts/switch_model.sh llama33 --context 8192
+  CPU_ONLY=1 bash scripts/switch_model.sh llama33 --context 16384
   SPEC_MODE=none bash scripts/switch_model.sh kat-npu
 EOF
 }
@@ -57,6 +63,14 @@ case "$MODEL" in
   gemma4|gemma)
     echo "Starting Gemma 4 26B A4B MoE (llama.cpp + vision) on :8000 ..."
     exec bash scripts/serve_gemma4.sh "$@"
+    ;;
+  qwen35-4b|qwen35|qwen3.5)
+    echo "Starting Qwen3.5-4B GGUF (llama.cpp, 262k native) on :8000 ..."
+    exec bash scripts/serve_qwen35_4b.sh "$@"
+    ;;
+  llama33|llama3.3|llama-70b|llama33-70b)
+    echo "Starting Llama 3.3 70B Instruct (llama.cpp, hybrid GPU+CPU) on :8000 ..."
+    exec bash scripts/serve_llama33.sh "$@"
     ;;
   -h|--help|help)
     usage
