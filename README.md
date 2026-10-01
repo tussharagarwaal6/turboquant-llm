@@ -7,13 +7,71 @@ Local LLM serving and browser automation for OpenCode.
 One model on port **8000** at a time via `scripts/switch_model.sh`:
 
 ```bash
+bash scripts/switch_model.sh qwen35-9b                   # 9B Q6_K, 100k, thinking + vision
 bash scripts/switch_model.sh qwen35-4b --context 262144   # fast GPU + vision
 bash scripts/switch_model.sh gemma4 --context 100000      # MoE + vision
 bash scripts/switch_model.sh kat-npu --context 100000     # KAT + spec decode
 bash scripts/switch_model.sh llama33 --context 8192       # Llama 3.3 70B hybrid GPU+CPU
 ```
 
+**Qwen3.5-9B Q6_K:** `qwen35-9b` uses the existing model at `~/models/qwen35-9b/Qwen_Qwen3.5-9B-Q6_K.gguf` and its matching `mmproj-Qwen_Qwen3.5-9B-f16.gguf`. Defaults match the verified Windows Hermes backend: **100000 context**, **reasoning on** (`deepseek` format), all GPU layers including embeddings, Q8/Q8 KV cache, flash attention, one parallel slot, batch/ubatch 512/256, no speculative decoding and no automatic fit adjustment. Served model id: **qwen35-9b** on port **8000**. Override example: `bash scripts/switch_model.sh qwen35-9b --context 100000 --reasoning on`. Higher contexts require a fresh VRAM fit check. Launcher environment overrides include `QWEN35_9B_GGUF_DIR`, `TARGET_GGUF`, `MMPROJ_GGUF`, `CTX_SIZE`, `REASONING` and `REASONING_FORMAT`.
+
 **Llama 3.3 70B:** one-time `bash scripts/download_llama33.sh` then `bash scripts/link_llama33_gguf.sh`. Default is **hybrid GPU offload** (`N_GPU_LAYERS=auto`) on the RTX 5080. On a **64 GB** host, run `scripts\setup_wsl_memory.ps1` (sets WSL to **48 GB**, leaves **16 GB** for Windows), then `wsl --shutdown`. Do **not** set WSL to 56 GB on 64 GB RAM — that causes 98% host usage and SSD pagefile thrashing. Check pressure: `powershell -File scripts\check_host_memory.ps1`. Benchmark: `bash scripts/bench_llama33.sh`.
+
+---
+
+## VS Code (native BYOK)
+
+Use the local LLM in **Visual Studio Code Chat** via Custom Endpoint BYOK. Traffic stays on `127.0.0.1:8000` — config lives in your user profile (`AppData`), not in this repo.
+
+**Requirements:** VS Code 1.122+, GitHub Copilot Chat extension (for the BYOK model picker).
+
+### One-time setup
+
+From the repo root in **PowerShell** (with the LLM already running on `:8000`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_vscode_byok.ps1
+```
+
+This merges `config/vscode-chatLanguageModels.template.json` into `%APPDATA%\Code\User\chatLanguageModels.json`, syncs the model id from `/v1/models`, and sets `contextWindow` from the server's `n_ctx` with **no `maxOutputTokens` cap** (suited for long production code generations).
+
+Optional: copy settings from `config/vscode-settings.local.json` into `%APPDATA%\Code\User\settings.json` so utility tasks (titles, commit messages) also use your local model.
+
+### Every session
+
+**Terminal 1 — WSL (LLM):**
+
+```bash
+bash scripts/switch_model.sh kat-npu --context 100000
+# or: bash scripts/switch_model.sh qwen35-4b --context 262144
+```
+
+Wait until `curl http://127.0.0.1:8000/v1/models` returns the active model.
+
+**In VS Code:**
+
+1. Reload Window (`Developer: Reload Window`) if you switched backend models
+2. Open Chat → model picker → **Manage Language Models** (gear)
+3. When prompted for `turboquantApiKey`, enter `local`
+4. Pin your local model (e.g. **KAT-Coder NPU (local)**)
+5. Hide GitHub-hosted models (eye icon) so private work stays on localhost
+6. Switch models mid-chat from the picker dropdown
+
+After `switch_model.sh` to a different backend, re-run `setup_vscode_byok.ps1` or Reload Window so `/v1/models` is picked up.
+
+### Enterprise privacy
+
+- BYOK Custom Endpoint requests go to `127.0.0.1` only — org admins do not see local prompts or model names
+- Do **not** use `scripts/tunnel.sh` for VS Code (that exposes localhost to the internet; it is for Cursor only)
+- Do **not** commit `chatLanguageModels.json` or API keys to workspace `.vscode/`
+- Copilot cloud usage is still visible to admins if you pick a GitHub-hosted model or use inline completions
+
+If **Chat: Manage Language Models** is missing, your org may have disabled BYOK — ask an admin to enable "Bring Your Own Language Model Key in VS Code" in Copilot policy settings.
+
+### Agent mode
+
+Agent mode needs `toolCalling: true`. **qwen** (TurboQuant) has the best tool support; **kat-npu** (llama.cpp) works for chat but agent reliability may be lower. Switch with `bash scripts/switch_model.sh qwen --context 32768` if tools misbehave.
 
 ---
 

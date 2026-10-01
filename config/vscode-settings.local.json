@@ -1,0 +1,5 @@
+{
+  "chat.byokUtilityModelDefault": "mainAgentModel",
+  "chat.utilityModel": "kat-coder-npu",
+  "chat.utilitySmallModel": "kat-coder-npu"
+}

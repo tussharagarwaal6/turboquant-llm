@@ -7,7 +7,8 @@
 # Usage:
 #   bash scripts/serve_gemma4.sh
 #   bash scripts/serve_gemma4.sh --context 100000
-#   bash scripts/switch_model.sh gemma4 --context 100000
+#   bash scripts/serve_gemma4.sh --context 100000 --reasoning off
+#   bash scripts/switch_model.sh gemma4 --context 100000 --reasoning off
 
 set -euo pipefail
 
@@ -33,6 +34,7 @@ CACHE_TYPE_K="${CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-q8_0}"
 LOAD_MODE="${LOAD_MODE:-none}"
 CACHE_RAM="${CACHE_RAM:-}"
+REASONING="${REASONING:-off}"
 
 LLAMA_PREBUILT="${LLAMA_PREBUILT:-$HOME/.local/bin/llama}"
 
@@ -43,6 +45,10 @@ Usage: bash scripts/serve_gemma4.sh [options]
   --context N     context size (default: $CTX_SIZE)
   --port N        listen port (default: $PORT)
   --n-cpu-moe N   MoE experts on CPU (only with numeric N_GPU_LAYERS)
+  --reasoning M   llama.cpp reasoning mode (default: $REASONING)
+                  Use 'off' so action JSON is not swallowed by thinking.
+                  Override with REASONING=auto (or another llama.cpp mode)
+                  to restore native Gemma thinking.
   -h, --help      show this help
 
 At --context 65536 and above, N_GPU_LAYERS defaults to 'all' and N_CPU_MOE to a
@@ -58,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --context)    CTX_SIZE="$2"; shift 2 ;;
     --port)       PORT="$2"; shift 2 ;;
     --n-cpu-moe)  N_CPU_MOE="$2"; _n_cpu_moe_set="yes"; shift 2 ;;
+    --reasoning)  REASONING="$2"; shift 2 ;;
     -h|--help)    usage; exit 0 ;;
     *)
       if [[ "$1" =~ ^[0-9]+$ ]]; then
@@ -122,6 +129,7 @@ args=(
   --cache-type-v "$CACHE_TYPE_V"
   --load-mode "$LOAD_MODE"
   --jinja
+  --reasoning "$REASONING"
   --spec-type none
 )
 
@@ -158,6 +166,7 @@ echo "  KV cache          = $CACHE_TYPE_K / $CACHE_TYPE_V"
 echo "  LOAD_MODE         = $LOAD_MODE"
 if [[ -n "$CACHE_RAM" ]]; then echo "  CACHE_RAM         = $CACHE_RAM"; fi
 echo "  multimodal        = enabled (--mmproj)"
+echo "  reasoning         = $REASONING"
 echo "  speculation       = disabled"
 echo
 

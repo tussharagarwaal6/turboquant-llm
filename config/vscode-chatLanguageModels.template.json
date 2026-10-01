@@ -1,0 +1,22 @@
+[
+  {
+    "name": "Local (turboquant)",
+    "vendor": "customendpoint",
+    "apiKey": "${input:turboquantApiKey}",
+    "apiType": "chat-completions",
+    "url": "http://127.0.0.1:8000/v1",
+    "models": [
+      {
+        "id": "kat-coder-npu",
+        "name": "KAT-Coder (local)",
+        "url": "http://127.0.0.1:8000/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "contextWindow": 100000,
+        "modelOptions": {
+          "temperature": 0.2
+        }
+      }
+    ]
+  }
+]
